@@ -1,0 +1,81 @@
+# .github/workflows/ci.yml
+# Runs on every pull request: template validation, dependency audit,
+# secrets detection. Merge to develop/main is blocked until all pass
+# (enforce via branch protection - see README).
+name: CI - Validate & Security Scan
+
+on:
+  pull_request:
+    branches: [develop, main]
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: SAM validate + cfn-lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install tools
+        run: pip install cfn-lint aws-sam-cli
+      - name: cfn-lint
+        run: cfn-lint template.yaml
+      - name: sam validate
+        run: sam validate --lint --region eu-west-3
+      - name: Python compile check
+        run: |
+          python -m py_compile src/backup/salesforce_backup.py
+          python -m py_compile src/rotation/rotation_function.py
+
+  lzv2-security-scan:
+    name: LZv2 org security scan
+    # Org-standard reusable workflow (pip-audit + trivy config + trivy image),
+    # pinned to release tag v2.0.0. Inputs match its workflow_call spec.
+    # NOTE: its docker jobs run unconditionally, so the repo MUST contain the
+    # Dockerfile at the path below - we point it at the Fargate exit-plan
+    # image, which keeps that image continuously scanned and buildable.
+    uses: tmwk-GDC/teamwork-aws-lzv2-workflows/.github/workflows/security-scan.yml@v2.0.0
+    permissions:
+      contents: read
+      security-events: write
+      issues: write
+    with:
+      python_lock_file: src/backup/requirements.txt
+      dockerfile_path: src/backup/Dockerfile
+      docker_context: src/backup
+      docker_image_name: salesforce-backup
+    secrets: inherit
+
+  secrets-scan:
+    name: Secrets detection (gitleaks)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  encrypt-only-guard:
+    name: SoD guard - no read-back permissions in template
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Fail if template grants backup-data read access
+        run: |
+          # The backup function must never regain GetObject / kms:Decrypt on
+          # the backup data path. This guard fails the build if someone adds
+          # them back "temporarily".
+          # Match only YAML Action list entries ("- s3:GetObject"), not comments
+          if grep -nE '^\s*-\s*(s3:GetObject|s3:ListBucket)\s*$' template.yaml; then
+            echo "::error::SoD violation: backup role must not read S3 backup data"; exit 1
+          fi
+          if grep -nE '^\s*-\s*kms:Decrypt\s*$' template.yaml; then
+            echo "::error::SoD violation: backup role must not hold kms:Decrypt"; exit 1
+          fi
+          echo "SoD guard passed: role remains encrypt-only"

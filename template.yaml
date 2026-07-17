@@ -1,0 +1,245 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  Salesforce -> S3 Backup (SAM) - customer UAT/PRD.
+  ISO 27001 SoD design: the backup function is ENCRYPT-ONLY - it can write
+  backups but can never read them back or decrypt them. KMS key and S3 bucket
+  are provisioned externally by CISO (Object Lock Compliance mode + deny
+  policies) and passed in as ARN parameters. Restore/decrypt access belongs
+  exclusively to the Salesforce data owner team.
+
+# ============================================================================
+# PARAMETERS
+# ============================================================================
+Parameters:
+
+  EnvironmentName:
+    Type: String
+    Default: uat
+    AllowedValues: [uat, prd]
+
+  KMSKeyArn:
+    Type: String
+    AllowedPattern: '^arn:aws:kms:[a-z0-9-]+:\d{12}:key/[a-f0-9-]+$'
+    Description: >
+      CISO-managed KMS key ARN (shared services account). The function is
+      granted kms:GenerateDataKey ONLY - no Decrypt. Key policy on the CISO
+      side must allow this account's backup role to GenerateDataKey.
+
+  S3BucketArn:
+    Type: String
+    AllowedPattern: '^arn:aws:s3:::[a-z0-9.-]+$'
+    Description: >
+      CISO-provisioned backup bucket ARN (Object Lock Compliance mode).
+      The function is granted s3:PutObject ONLY - GetObject is both absent
+      from this role AND explicitly denied by the CISO bucket policy.
+
+  SalesforceUsername:
+    Type: String
+
+  SalesforceLoginUrl:
+    Type: String
+    Description: Customer My Domain URL, e.g. https://customer.my.salesforce.com
+
+  BackupScheduleCron:
+    Type: String
+    Default: "cron(0 1 * * ? *)"
+
+# ============================================================================
+# GLOBALS
+# ============================================================================
+Globals:
+  Function:
+    Runtime: python3.12
+    MemorySize: 512
+    Architectures: [x86_64]
+
+# ============================================================================
+# RESOURCES
+# ============================================================================
+Resources:
+
+  # --------------------------------------------------------------------------
+  # SNS alerts
+  # --------------------------------------------------------------------------
+  BackupAlertsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub salesforce-backup-alerts-${EnvironmentName}
+
+  # --------------------------------------------------------------------------
+  # Secrets Manager - credentials with 90-day rotation
+  # --------------------------------------------------------------------------
+  BackupSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub salesforce-backup-${EnvironmentName}/credentials
+      Description: JWT private key, consumer key and Pardot credentials
+      SecretString: |
+        {
+          "sf_jwt_private_key": "REPLACE_VIA_SECURE_CHANNEL",
+          "sf_consumer_key": "REPLACE_VIA_SECURE_CHANNEL",
+          "pardot_client_secret": "skip",
+          "pardot_username": "skip",
+          "pardot_password": "skip",
+          "pardot_security_token": ""
+        }
+
+  SecretRotationSchedule:
+    Type: AWS::SecretsManager::RotationSchedule
+    Properties:
+      SecretId: !Ref BackupSecret
+      RotationRules:
+        AutomaticallyAfterDays: 90
+      RotationLambdaARN: !GetAtt RotationFunction.Arn
+
+  RotationFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub salesforce-backup-rotation-${EnvironmentName}
+      # Semi-automated JWT rotation: createSecret generates a new RSA keypair;
+      # setSecret publishes the new public cert via SNS for the SF admin to
+      # upload; testSecret verifies JWT auth with the pending key (retried by
+      # Secrets Manager until the cert is uploaded); finishSecret finalizes.
+      Description: Semi-automated 90-day JWT key rotation for the backup secret
+      Handler: rotation_function.lambda_handler
+      CodeUri: src/rotation/
+      Timeout: 60
+      Environment:
+        Variables:
+          SNS_TOPIC_ARN: !Ref BackupAlertsTopic
+          SF_LOGIN_URL: !Ref SalesforceLoginUrl
+          SF_USERNAME: !Ref SalesforceUsername
+      Policies:
+        - Statement:
+            - Sid: RotateThisSecretOnly
+              Effect: Allow
+              Action:
+                - secretsmanager:GetSecretValue
+                - secretsmanager:PutSecretValue
+                - secretsmanager:DescribeSecret
+                - secretsmanager:UpdateSecretVersionStage
+              Resource: !Ref BackupSecret
+            - Sid: NotifyAdmin
+              Effect: Allow
+              Action: sns:Publish
+              Resource: !Ref BackupAlertsTopic
+
+  RotationInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref RotationFunction
+      Action: lambda:InvokeFunction
+      Principal: secretsmanager.amazonaws.com
+      SourceAccount: !Ref AWS::AccountId
+
+  # --------------------------------------------------------------------------
+  # Backup function - ENCRYPT-ONLY by design
+  # --------------------------------------------------------------------------
+  BackupFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub salesforce-backup-${EnvironmentName}
+      Description: Exports Salesforce objects to S3 (write-only, cannot read backups back)
+      Handler: salesforce_backup.lambda_handler
+      CodeUri: src/backup/
+      Timeout: 900
+      EphemeralStorage:
+        Size: 2048
+      Environment:
+        Variables:
+          SF_USERNAME: !Ref SalesforceUsername
+          SF_LOGIN_URL: !Ref SalesforceLoginUrl
+          AWS_REGION_NAME: !Ref AWS::Region
+          S3_BUCKET: !Select [5, !Split [':', !Ref S3BucketArn]]
+          KMS_KEY_ID: !Ref KMSKeyArn
+          SECRETS_MANAGER_SECRET_ID: !Sub salesforce-backup-${EnvironmentName}/credentials
+          SNS_TOPIC_ARN: !Ref BackupAlertsTopic
+          EXPORT_SCOPE: customer
+          MAX_PARALLEL_EXPORTS: '6'
+          WEEKLY_ONLY_OBJECTS: visitors,visitor-activities
+          FULL_EXPORT_WEEKDAY: '6'
+          LOG_LEVEL: INFO
+          PARDOT_CLIENT_ID: skip
+          PARDOT_BUSINESS_UNIT_ID: skip
+          PARDOT_INCLUDE_HIGH_VOLUME: 'false'
+      Events:
+        DailySchedule:
+          Type: Schedule
+          Properties:
+            Name: !Sub salesforce-backup-daily-${EnvironmentName}
+            Schedule: !Ref BackupScheduleCron
+            RetryPolicy:
+              MaximumRetryAttempts: 2
+      Policies:
+        - Statement:
+            # ---- SoD core: WRITE-ONLY data path ----
+            - Sid: S3PutOnly
+              Effect: Allow
+              Action: s3:PutObject          # deliberately NO GetObject/ListBucket
+              Resource: !Sub ${S3BucketArn}/*
+            - Sid: KMSEncryptOnly
+              Effect: Allow
+              Action:                        # GenerateDataKey ONLY - decrypt is excluded by design
+                - kms:GenerateDataKey
+              Resource: !Ref KMSKeyArn
+            # ---- Operational permissions (no backup-data access) ----
+            - Sid: SecretsReadSpecificArn
+              Effect: Allow
+              Action: secretsmanager:GetSecretValue
+              Resource: !Ref BackupSecret    # exact ARN, no wildcard
+            - Sid: SNSPublish
+              Effect: Allow
+              Action: sns:Publish
+              Resource: !Ref BackupAlertsTopic
+            - Sid: SESSend
+              Effect: Allow
+              Action: ses:SendEmail
+              Resource: !Sub arn:aws:ses:${AWS::Region}:${AWS::AccountId}:identity/*
+            - Sid: VolumeMetricsHistory
+              Effect: Allow
+              Action:                        # SoD-compliant anomaly history store
+                - cloudwatch:PutMetricData   # (counts only - no PII)
+                - cloudwatch:GetMetricStatistics
+              Resource: '*'
+              Condition:
+                StringEqualsIfExists:
+                  cloudwatch:namespace: SalesforceBackup
+
+  # --------------------------------------------------------------------------
+  # Duration early-warning (architecture decision trigger: 600s = 2/3 timeout)
+  # --------------------------------------------------------------------------
+  DurationAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub salesforce-backup-duration-${EnvironmentName}
+      AlarmDescription: >
+        Backup duration exceeded 600s (2/3 of Lambda timeout) - per the
+        architecture decision record, 3 consecutive breaches trigger the
+        Fargate migration plan.
+      Namespace: AWS/Lambda
+      MetricName: Duration
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref BackupFunction
+      Statistic: Maximum
+      Period: 86400
+      EvaluationPeriods: 1
+      Threshold: 600000
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref BackupAlertsTopic
+
+Outputs:
+
+  BackupFunctionName:
+    Value: !Ref BackupFunction
+
+  SecretArn:
+    Description: Load real credentials via a secure channel before first run
+    Value: !Ref BackupSecret
+
+  AlertsTopicArn:
+    Description: Subscribe SecOps / ops email here
+    Value: !Ref BackupAlertsTopic
