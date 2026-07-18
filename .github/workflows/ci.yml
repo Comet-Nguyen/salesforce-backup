@@ -38,7 +38,7 @@ jobs:
     # NOTE: its docker jobs run unconditionally, so the repo MUST contain the
     # Dockerfile at the path below - we point it at the Fargate exit-plan
     # image, which keeps that image continuously scanned and buildable.
-    uses: tmwk-GDC/teamwork-aws-lzv2-workflows/.github/workflows/security-scan.yml@v2.0.0
+    uses:  Comet-Nguyen/salesforce-backup/.github/workflows/security-scan.yml@v2.0.0
     permissions:
       contents: read
       security-events: write
