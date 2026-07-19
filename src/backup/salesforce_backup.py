@@ -1072,7 +1072,7 @@ def run_backup(cfg: Optional[Config] = None, mode_override: Optional[str] = None
             skip_empty = os.environ.get("SKIP_EMPTY_OBJECTS", "true").strip().lower() != "false"
             try:
                 export_map, discovered, skipped = discover_export_objects(sf, export_scope, skip_empty)
-            except Exception as exc:  # noqa: BLE001 - discovery failure falls back to static list
+            except Exception:  # noqa: BLE001 - discovery failure falls back to static list
                 logger.exception("Object discovery failed - falling back to static list")
                 export_map, discovered, skipped = dict(OBJECTS_TO_EXPORT), len(OBJECTS_TO_EXPORT), 0
             logger.info("Exporting %s objects (scope=%s, discovered=%s, skipped=%s, mode=%s)",

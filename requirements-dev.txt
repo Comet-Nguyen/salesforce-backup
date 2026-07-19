@@ -1,0 +1,8 @@
+# Runtime
+-r src/backup/requirements.txt
+
+# CI / Dev tools
+ruff==0.12.7
+pytest==8.4.1
+cfn-lint==1.39.1
+checkov==3.2.468

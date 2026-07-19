@@ -1,19 +1,4 @@
 # sam-deploy.yml - repo-local reusable SAM deployment (interim)
-#
-# Per Architect decision: the org-level sam-deploy reusable workflow will be
-# authored by the LZv2 team later (same pattern as Terraform: lint -> scan ->
-# build -> deploy). Until then this repo-local workflow unblocks deployments;
-# deploy.yml calls it via `uses: ./.github/workflows/sam-deploy.yml` and will
-# switch to the LZv2 reference in a one-line change once published.
-#
-# PREREQUISITE - CI identity (one-time setup per account):
-# The SSO permission-set roles used by humans (e.g. CloudOps in the GDC-PROD
-# account) CANNOT be assumed by GitHub Actions - their trust policy only
-# trusts the IAM Identity Center provider. CI needs a dedicated IAM role per
-# account trusting GitHub's OIDC provider (token.actions.githubusercontent.com),
-# with the sub condition pinned to this repo. Create it once using CloudOps
-# access, then store its ARN in the GitHub Environment variable referenced by
-# the caller (AWS_DEPLOY_ROLE_UAT / _PRD).
 name: SAM Deploy
 
 on:
@@ -34,7 +19,7 @@ on:
       aws_region:
         description: "Target AWS region"
         type: string
-        default: "eu-west-3"
+        default: "us-west-2"
       role_arn:
         description: "IAM role ARN to assume via OIDC for the deployment"
         type: string
@@ -48,7 +33,7 @@ on:
         type: string
         default: "3.12"
       artifact_bucket:
-        description: "Existing S3 bucket for SAM build artifacts. Empty = --resolve-s3 (SAM-managed bucket; may be blocked by LZ SCP/naming policies)"
+        description: "Existing S3 bucket for SAM build artifacts. Empty = --resolve-s3"
         type: string
         default: ""
       tags:
@@ -65,23 +50,26 @@ jobs:
     name: SAM deploy (${{ inputs.github_environment }})
     runs-on: ubuntu-latest
     environment: ${{ inputs.github_environment }}
+    timeout-minutes: 30  # [CẢI THIỆN] Tự động ngắt nếu vượt quá 30 phút, tránh treo pipeline
     concurrency:
       group: sam-deploy-${{ inputs.stack_name }}-${{ inputs.github_environment }}
-      cancel-in-progress: false      # never cancel a running CloudFormation deploy
+      cancel-in-progress: false
+      
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout Code
+        uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
+      - name: Setup Python ${{ inputs.python_version }}
+        uses: actions/setup-python@v5
         with:
           python-version: ${{ inputs.python_version }}
+          cache: 'pip'   # [CẢI THIỆN] Cache các thư viện pip để build nhanh hơn
 
-      - uses: aws-actions/setup-sam@v2
+      - name: Setup AWS SAM CLI
+        uses: aws-actions/setup-sam@v2
         with:
-          use-installer: true      # prebuilt binary - much faster than pip install
+          use-installer: true
 
-      # --lint runs cfn-lint locally: no AWS credentials required, which is
-      # why this step can (and should) run before assuming the OIDC role -
-      # a broken template fails fast without ever touching the account.
       - name: Validate template
         run: |
           sam validate --lint \
@@ -95,22 +83,46 @@ jobs:
           aws-region: ${{ inputs.aws_region }}
 
       - name: SAM build
-        run: sam build --template ${{ inputs.template_path }}
+        run: |
+          sam build \
+            --template ${{ inputs.template_path }} \
+            --cached     # [CẢI THIỆN] Tái sử dụng các artifact đã build trước đó nếu source code không đổi
 
       - name: SAM deploy
+        env: # [CẢI THIỆN] Đưa tham số vào Environment Variables để an toàn hơn
+          ARTIFACT_BUCKET: ${{ inputs.artifact_bucket }}
+          TAGS: ${{ inputs.tags }}
+          PARAMS: ${{ inputs.parameter_overrides }}
         run: |
-          sam deploy \
-            --stack-name ${{ inputs.stack_name }} \
-            --region ${{ inputs.aws_region }} \
-            --capabilities CAPABILITY_NAMED_IAM \
-            --no-confirm-changeset \
-            --no-fail-on-empty-changeset \
-            --no-progressbar \
-            ${{ inputs.artifact_bucket != '' && format('--s3-bucket {0}', inputs.artifact_bucket) || '--resolve-s3' }} \
-            ${{ inputs.tags != '' && format('--tags {0}', inputs.tags) || '' }} \
-            ${{ inputs.parameter_overrides != '' && format('--parameter-overrides {0}', inputs.parameter_overrides) || '' }}
+          # [CẢI THIỆN] Sử dụng mảng (Array) trong Bash để quản lý các cờ động an toàn và gọn gàng hơn
+          DEPLOY_ARGS=(
+            --stack-name "${{ inputs.stack_name }}"
+            --region "${{ inputs.aws_region }}"
+            --capabilities CAPABILITY_NAMED_IAM
+            --no-confirm-changeset
+            --no-fail-on-empty-changeset
+            --no-progressbar
+          )
+
+          if [ -n "$ARTIFACT_BUCKET" ]; then
+            DEPLOY_ARGS+=(--s3-bucket "$ARTIFACT_BUCKET")
+          else
+            DEPLOY_ARGS+=(--resolve-s3)
+          fi
+
+          if [ -n "$TAGS" ]; then
+            DEPLOY_ARGS+=(--tags $TAGS)
+          fi
+
+          if [ -n "$PARAMS" ]; then
+            DEPLOY_ARGS+=(--parameter-overrides $PARAMS)
+          fi
+
+          # Thực thi lệnh
+          sam deploy "${DEPLOY_ARGS[@]}"
 
       - name: Describe stack outputs
+        if: success()    # [CẢI THIỆN] Chỉ in output ra khi deploy hoàn toàn thành công
         run: |
           aws cloudformation describe-stacks \
             --stack-name ${{ inputs.stack_name }} \

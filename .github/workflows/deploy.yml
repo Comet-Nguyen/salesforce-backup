@@ -1,22 +1,23 @@
 # .github/workflows/deploy.yml
-# UAT: automatic on merge to develop. PRD: manual approval via the protected
-# "prd" GitHub Environment (Settings > Environments > prd > Required reviewers).
 #
-# NOTE ON LZv2 (verified against tmwk-GDC/teamwork-aws-lzv2-workflows @v2.0.0):
-# the repo provides Terraform deployment workflows (terraform-deployment.yml,
-# terraform-plan/apply, ...) and Docker/ECS workflows only - there is NO
-# reusable workflow for SAM/CloudFormation. Since the architecture review
-# mandates SAM for this workload, deployment is implemented directly below
-# with SAM + OIDC (same security posture: no static keys). The org-standard
-# LZv2 security-scan.yml IS consumed - see ci.yml. Raised with the Architect
-# team: either LZv2 adds a sam-deploy workflow, or this repo-local SAM job
-# is the accepted pattern for serverless workloads.
+# Thin caller: all deployment mechanics live in the reusable sam-deploy.yml,
+# so switching to the org-standard LZv2 workflow later is a one-line change
+# (replace the local `uses:` path with the tmwk-GDC reference + tag).
+#
+# VARIABLE SCOPE - IMPORTANT:
+# A job that calls a reusable workflow cannot declare `environment:` (the
+# environment is declared inside sam-deploy.yml). Expressions in `with:` are
+# evaluated in the CALLER context, which has no environment selected, so
+# environment-scoped variables resolve to an empty string here.
+# => every variable below MUST be a REPOSITORY variable (with _UAT/_PRD suffix).
+# The prd environment still enforces its required-reviewer gate, because
+# sam-deploy.yml sets `environment: prd` on the job that actually deploys.
 name: Deploy
 
 on:
   push:
     branches: [develop]        # -> UAT
-  workflow_dispatch:            # -> PRD (manual trigger from main)
+  workflow_dispatch:           # -> PRD (manual, from main only)
     inputs:
       environment:
         description: Target environment
@@ -25,20 +26,25 @@ on:
         options: [prd]
 
 permissions:
-  id-token: write               # OIDC to AWS - no long-lived keys in GitHub
+  id-token: write              # OIDC to AWS - no long-lived keys in GitHub
   contents: read
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false    # never cancel an in-flight CloudFormation deploy
+
 jobs:
-  # Reusable SAM workflow authored in LZv2 conventions - lives locally until
-  # the PR to tmwk-GDC/teamwork-aws-lzv2-workflows is merged, then switch the
-  # `uses:` to the tagged LZv2 reference.
   deploy-uat:
+    name: Deploy UAT
     if: github.ref_name == 'develop'
     uses: ./.github/workflows/sam-deploy.yml
-    # after LZv2 merge: tmwk-GDC/teamwork-aws-lzv2-workflows/.github/workflows/sam-deploy.yml@vX.Y.Z
+    # after LZv2 publishes it:
+    #   tmwk-GDC/teamwork-aws-lzv2-workflows/.github/workflows/sam-deploy.yml@vX.Y.Z
     with:
       github_environment: uat
       stack_name: salesforce-backup-uat
+      aws_region: ${{ vars.AWS_REGION_UAT }}
+      artifact_bucket: ${{ vars.SAM_ARTIFACT_BUCKET_UAT }}
       role_arn: ${{ vars.AWS_DEPLOY_ROLE_UAT }}
       parameter_overrides: >-
         EnvironmentName=uat
@@ -48,12 +54,15 @@ jobs:
         SalesforceLoginUrl=${{ vars.SF_LOGIN_URL_UAT }}
 
   deploy-prd:
-    if: github.event_name == 'workflow_dispatch' && inputs.environment == 'prd'
+    name: Deploy PRD
+    # Manual dispatch from main only; sam-deploy.yml adds the prd reviewer gate
+    if: github.event_name == 'workflow_dispatch' && inputs.environment == 'prd' && github.ref_name == 'main'
     uses: ./.github/workflows/sam-deploy.yml
-    # after LZv2 merge: tmwk-GDC/teamwork-aws-lzv2-workflows/.github/workflows/sam-deploy.yml@vX.Y.Z
     with:
-      github_environment: prd    # protected environment = required reviewer gate
+      github_environment: prd
       stack_name: salesforce-backup-prd
+      aws_region: ${{ vars.AWS_REGION_PRD }}
+      artifact_bucket: ${{ vars.SAM_ARTIFACT_BUCKET_PRD }}
       role_arn: ${{ vars.AWS_DEPLOY_ROLE_PRD }}
       parameter_overrides: >-
         EnvironmentName=prd
