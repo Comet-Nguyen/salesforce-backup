@@ -163,4 +163,4 @@ jobs:
       dockerfile_path: src/backup/Dockerfile
       docker_context: src/backup
       docker_image_name: salesforce-backup
-      trivyignore_path: .trivyignorev
+      trivyignore_path: .trivyignore
