@@ -3,8 +3,11 @@
 # The container runs one backup then exits - it is a scheduled task, not a service.
 FROM public.ecr.aws/docker/library/python:3.12-slim
 
-# Non-root user - least privilege inside the container
-RUN useradd --create-home --shell /usr/sbin/nologin backup
+# Non-root user - least privilege inside the container.
+# `id -u backup` guards against base images that already ship a same-named
+# user (seen on some python:3.12-slim rebuilds) - useradd would otherwise
+# fail the build with "user already exists".
+RUN id -u backup >/dev/null 2>&1 || useradd --create-home --shell /usr/sbin/nologin backup
 WORKDIR /app
 
 COPY requirements.txt .

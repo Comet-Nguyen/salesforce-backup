@@ -126,7 +126,9 @@ def _create_secret(sm, arn: str, token: str) -> None:
 def _set_secret(sm, arn: str, token: str) -> None:
     """Human gate: send the new public cert to the Salesforce admin."""
     pending = json.loads(
-        sm.get_secret_value(SecretId=arn, VersionId=token, VersionStage="AWSPENDING")["SecretString"]
+        sm.get_secret_value(SecretId=arn, VersionId=token, VersionStage="AWSPENDING")[
+            "SecretString"
+        ]
     )
     cert_pem = pending.get("_pending_public_cert", "")
     boto3.client("sns").publish(
@@ -149,7 +151,9 @@ def _test_secret(sm, arn: str, token: str) -> None:
     """Real JWT auth with the PENDING key. Failure here is the designed
     wait-for-human gate - Secrets Manager retries until the cert is uploaded."""
     pending = json.loads(
-        sm.get_secret_value(SecretId=arn, VersionId=token, VersionStage="AWSPENDING")["SecretString"]
+        sm.get_secret_value(SecretId=arn, VersionId=token, VersionStage="AWSPENDING")[
+            "SecretString"
+        ]
     )
     consumer_key = pending.get("sf_consumer_key", "").strip()
     if not consumer_key:
@@ -185,7 +189,11 @@ def _test_secret(sm, arn: str, token: str) -> None:
 def _finish_secret(sm, arn: str, token: str) -> None:
     metadata = sm.describe_secret(SecretId=arn)
     current_version = next(
-        (v for v, stages in metadata["VersionIdsToStages"].items() if "AWSCURRENT" in stages),
+        (
+            v
+            for v, stages in metadata["VersionIdsToStages"].items()
+            if "AWSCURRENT" in stages
+        ),
         None,
     )
     if current_version == token:
