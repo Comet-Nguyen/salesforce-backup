@@ -1,0 +1,18 @@
+# perl-base CVEs (Debian 13.6 base image dependency, not invoked by our code):
+#
+# CVE-2026-13221 - Perl regex trie 16-bit overflow -> silently wrong matches.
+#                   Requires compiling an attacker-crafted regex via Perl.
+#                   Our Lambda runs only Python; perl-base is a transitive
+#                   dpkg dependency of python:3.12-slim, never executed.
+#                   Fixed upstream in Perl 5.43.10; re-check on next base
+#                   image bump.
+CVE-2026-13221
+
+# CVE-2026-42496 - perl-archive-tar path traversal via crafted symlinks.
+#                   We never call Archive::Tar or any Perl code; not reachable.
+CVE-2026-42496
+
+# CVE-2026-8376  - Perl regex heap buffer overflow, 32-bit builds only.
+#                   Container runs linux/amd64 (64-bit); not applicable, and
+#                   still requires invoking Perl, which we never do.
+CVE-2026-8376

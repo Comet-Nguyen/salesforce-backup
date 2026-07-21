@@ -15,9 +15,9 @@ on:
         type: string
         default: ""
       dockerfile_path:
-        description: "Path to Dockerfile for trivy"
+        description: "Path to Dockerfile for trivy (empty = skip docker scans)"
         type: string
-        default: "app/Dockerfile"
+        default: ""
       docker_context:
         description: "Docker build context for image scan"
         type: string
@@ -91,6 +91,7 @@ jobs:
 
       - name: Trivy Dockerfile scan
         id: trivy-config
+        if: inputs.dockerfile_path != ''
         continue-on-error: true
         uses: aquasecurity/trivy-action@v0.35.0
         with:
@@ -122,7 +123,7 @@ jobs:
             });
 
       - name: Close resolved security issues
-        if: (steps.pip-audit.outcome == 'success' || steps.pip-audit.outcome == 'skipped') && (steps.pnpm-audit.outcome == 'success' || steps.pnpm-audit.outcome == 'skipped') && steps.trivy-config.outcome == 'success'
+        if: (steps.pip-audit.outcome == 'success' || steps.pip-audit.outcome == 'skipped') && (steps.pnpm-audit.outcome == 'success' || steps.pnpm-audit.outcome == 'skipped') && (steps.trivy-config.outcome == 'success' || steps.trivy-config.outcome == 'skipped')
         uses: actions/github-script@v7.0.1
         with:
           script: |
@@ -150,6 +151,10 @@ jobs:
 
   docker-image-scan:
     name: Docker Image Vulnerability Scan
+    # Serverless repos have no Dockerfile - skip the whole job when the
+    # caller passes an empty dockerfile_path (mirrors the python_lock_file
+    # pattern above). This is the change we proposed upstream to LZv2.
+    if: inputs.dockerfile_path != ''
     runs-on: ubuntu-latest
     needs: security-scan
     steps:
