@@ -257,7 +257,7 @@ Resources:
         DailySchedule:
           Type: Schedule
           Properties:
-            Name: !Sub salesforce-backup-daily-${EnvironmentName}
+            Name: !Sub salesforce-backup-sfn-daily-${EnvironmentName}
             Schedule: !Ref BackupScheduleCron
             # step_handler's discover treats null mode as "decide by weekday"
             # (Saturday = full). The key MUST exist: the state machine reads
