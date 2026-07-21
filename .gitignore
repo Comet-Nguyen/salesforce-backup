@@ -3,3 +3,5 @@ samconfig.toml
 __pycache__/
 *.pyc
 .env
+
+src/backup/Dockerfile   # Fargate exit plan - kept locally, not scanned

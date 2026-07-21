@@ -1,0 +1,170 @@
+# .github/workflows/deploy.yml
+#
+# Flat deployment workflow: each job declares `environment:` directly, so
+# ENVIRONMENT-scoped variables (no _UAT/_PRD suffix) resolve correctly and the
+# prd environment's required-reviewer gate applies to the job itself.
+#
+# Interim by design. When the LZv2 team publishes the org-standard
+# sam-deploy.yml reusable workflow, these two jobs collapse into thin callers
+# (`uses: tmwk-GDC/teamwork-aws-lzv2-workflows/.github/workflows/sam-deploy.yml@vX`).
+# NOTE for that migration: a job calling a reusable workflow cannot declare
+# `environment:`, so the variables below must then move to repository level
+# (with _UAT/_PRD suffixes) or be resolved inside the reusable workflow.
+name: Deploy
+
+on:
+  push:
+    branches: [develop]        # -> UAT
+  workflow_dispatch:           # -> PRD (manual, from main only)
+    inputs:
+      environment:
+        description: Target environment
+        required: true
+        type: choice
+        options: [prd]
+
+permissions:
+  id-token: write              # OIDC to AWS - no long-lived keys in GitHub
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false    # never cancel an in-flight CloudFormation deploy
+
+jobs:
+  deploy-uat:
+    name: Deploy UAT
+    if: github.ref_name == 'develop'
+    runs-on: ubuntu-latest
+    environment: uat
+    timeout-minutes: 30
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Setup AWS SAM CLI
+        uses: aws-actions/setup-sam@v2
+        with:
+          use-installer: true
+
+      # Runs cfn-lint internally and needs no credentials - fail fast before
+      # touching the account.
+      - name: Validate template
+        run: sam validate --lint --template template.yaml --region ${{ vars.AWS_REGION }}
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: SAM build
+        run: sam build --template template.yaml --cached
+
+      - name: SAM deploy
+        env:
+          ARTIFACT_BUCKET: ${{ vars.SAM_ARTIFACT_BUCKET }}
+        run: |
+          DEPLOY_ARGS=(
+            --stack-name salesforce-backup-uat
+            --region "${{ vars.AWS_REGION }}"
+            --capabilities CAPABILITY_NAMED_IAM
+            --no-confirm-changeset
+            --no-fail-on-empty-changeset
+            --no-progressbar
+          )
+          if [ -n "$ARTIFACT_BUCKET" ]; then
+            DEPLOY_ARGS+=(--s3-bucket "$ARTIFACT_BUCKET")
+          else
+            DEPLOY_ARGS+=(--resolve-s3)
+          fi
+          DEPLOY_ARGS+=(--parameter-overrides
+            "EnvironmentName=uat"
+            "KMSKeyArn=${{ vars.KMS_KEY_ARN }}"
+            "S3BucketArn=${{ vars.S3_BUCKET_ARN }}"
+            "SalesforceUsername=${{ vars.SF_USERNAME }}"
+            "SalesforceLoginUrl=${{ vars.SF_LOGIN_URL }}"
+          )
+          sam deploy "${DEPLOY_ARGS[@]}"
+
+      - name: Describe stack outputs
+        if: success()
+        run: |
+          aws cloudformation describe-stacks \
+            --stack-name salesforce-backup-uat \
+            --region ${{ vars.AWS_REGION }} \
+            --query "Stacks[0].Outputs" --output table
+
+  deploy-prd:
+    name: Deploy PRD
+    # Manual dispatch from main only; the prd environment adds the reviewer gate
+    if: github.event_name == 'workflow_dispatch' && inputs.environment == 'prd' && github.ref_name == 'main'
+    runs-on: ubuntu-latest
+    environment: prd
+    timeout-minutes: 30
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Setup AWS SAM CLI
+        uses: aws-actions/setup-sam@v2
+        with:
+          use-installer: true
+
+      - name: Validate template
+        run: sam validate --lint --template template.yaml --region ${{ vars.AWS_REGION }}
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: SAM build
+        run: sam build --template template.yaml --cached
+
+      - name: SAM deploy
+        env:
+          ARTIFACT_BUCKET: ${{ vars.SAM_ARTIFACT_BUCKET }}
+        run: |
+          DEPLOY_ARGS=(
+            --stack-name salesforce-backup-prd
+            --region "${{ vars.AWS_REGION }}"
+            --capabilities CAPABILITY_NAMED_IAM
+            --no-confirm-changeset
+            --no-fail-on-empty-changeset
+            --no-progressbar
+          )
+          if [ -n "$ARTIFACT_BUCKET" ]; then
+            DEPLOY_ARGS+=(--s3-bucket "$ARTIFACT_BUCKET")
+          else
+            DEPLOY_ARGS+=(--resolve-s3)
+          fi
+          DEPLOY_ARGS+=(--parameter-overrides
+            "EnvironmentName=prd"
+            "KMSKeyArn=${{ vars.KMS_KEY_ARN }}"
+            "S3BucketArn=${{ vars.S3_BUCKET_ARN }}"
+            "SalesforceUsername=${{ vars.SF_USERNAME }}"
+            "SalesforceLoginUrl=${{ vars.SF_LOGIN_URL }}"
+          )
+          sam deploy "${DEPLOY_ARGS[@]}"
+
+      - name: Describe stack outputs
+        if: success()
+        run: |
+          aws cloudformation describe-stacks \
+            --stack-name salesforce-backup-prd \
+            --region ${{ vars.AWS_REGION }} \
+            --query "Stacks[0].Outputs" --output table
