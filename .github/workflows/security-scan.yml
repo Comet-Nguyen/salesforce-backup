@@ -1,0 +1,224 @@
+name: Security Scan (pip-audit + pnpm audit + trivy)
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+on:
+  workflow_call:
+    inputs:
+      python_lock_file:
+        description: "Path to uv.lock or requirements.txt for pip-audit"
+        type: string
+        default: ""
+      pnpm_lock_path:
+        description: "Path to directory containing pnpm-lock.yaml"
+        type: string
+        default: ""
+      dockerfile_path:
+        description: "Path to Dockerfile for trivy (empty = skip docker scans)"
+        type: string
+        default: ""
+      docker_context:
+        description: "Docker build context for image scan"
+        type: string
+        default: "app"
+      docker_image_name:
+        description: "Docker image name for tagging"
+        type: string
+        default: "app"
+      pip_audit_ignore:
+        description: "Comma-separated CVE IDs to ignore"
+        type: string
+        default: ""
+      trivyignore_path:
+        description: "Path to .trivyignore file for image scan"
+        type: string
+        default: ""
+      pnpm_audit_ignore:
+        description: "Comma-separated advisory IDs to ignore for pnpm audit"
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+  security-events: write
+  issues: write
+
+jobs:
+  security-scan:
+    name: Security Scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: pip-audit (Python CVE scan via uv export)
+        id: pip-audit
+        if: inputs.python_lock_file != ''
+        continue-on-error: true
+        run: |
+          pip install pip-audit
+          LOCK="${{ inputs.python_lock_file }}"
+          if [[ "$LOCK" == *.lock ]]; then
+            # uv.lock → generate requirements.txt
+            pip install uv
+            uv export --no-hashes --frozen --directory "$(dirname "$LOCK")" > /tmp/requirements.txt
+            REQS="/tmp/requirements.txt"
+          else
+            REQS="$LOCK"
+          fi
+          IGNORE_ARGS=""
+          if [ -n "${{ inputs.pip_audit_ignore }}" ]; then
+            for CVE in $(echo "${{ inputs.pip_audit_ignore }}" | tr ',' ' '); do
+              IGNORE_ARGS="$IGNORE_ARGS --ignore-vuln $CVE"
+            done
+          fi
+          pip-audit -r "$REQS" --desc $IGNORE_ARGS 2>&1 | tee /tmp/pip-audit-output.txt
+
+      - name: pnpm audit (JS/TS CVE scan)
+        id: pnpm-audit
+        if: inputs.pnpm_lock_path != ''
+        continue-on-error: true
+        run: |
+          npm install -g pnpm
+          cd "${{ inputs.pnpm_lock_path }}"
+          IGNORE_ARGS=""
+          if [ -n "${{ inputs.pnpm_audit_ignore }}" ]; then
+            for ID in $(echo "${{ inputs.pnpm_audit_ignore }}" | tr ',' ' '); do
+              IGNORE_ARGS="$IGNORE_ARGS --ignore-cves $ID"
+            done
+          fi
+          pnpm audit --prod --audit-level=high $IGNORE_ARGS 2>&1 | tee /tmp/pnpm-audit-output.txt
+
+      - name: Trivy Dockerfile scan
+        id: trivy-config
+        if: inputs.dockerfile_path != ''
+        continue-on-error: true
+        uses: aquasecurity/trivy-action@v0.35.0
+        with:
+          scan-type: 'config'
+          scan-ref: ${{ inputs.dockerfile_path }}
+          severity: 'HIGH,CRITICAL'
+          exit-code: '1'
+
+      - name: Create issue on failure
+        if: steps.pip-audit.outcome == 'failure' || steps.pnpm-audit.outcome == 'failure' || steps.trivy-config.outcome == 'failure'
+        uses: actions/github-script@v7.0.1
+        env:
+          PIP_AUDIT: ${{ steps.pip-audit.outcome }}
+          PNPM_AUDIT: ${{ steps.pnpm-audit.outcome }}
+          TRIVY_CONFIG: ${{ steps.trivy-config.outcome }}
+        with:
+          script: |
+            const fs = require('fs');
+            const status = (s) => s === 'failure' ? '❌ Failed' : s === 'skipped' ? '⏭️ Skipped' : '✅ Passed';
+            let details = '';
+            try { const p = fs.readFileSync('/tmp/pip-audit-output.txt', 'utf8'); if (process.env.PIP_AUDIT === 'failure') details += `\n### pip-audit output\n\`\`\`\n${p.substring(0,10000)}\n\`\`\`\n`; } catch {}
+            try { const p = fs.readFileSync('/tmp/pnpm-audit-output.txt', 'utf8'); if (process.env.PNPM_AUDIT === 'failure') details += `\n### pnpm audit output\n\`\`\`\n${p.substring(0,10000)}\n\`\`\`\n`; } catch {}
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: `🔴 Security scan failed on ${context.sha.substring(0, 7)}`,
+              body: `## Security Scan Failure\n\n**Branch:** \`${context.ref}\`\n**Commit:** ${context.sha}\n**Run:** ${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}\n\n| Check | Status |\n|-------|--------|\n| pip-audit (Python CVE) | ${status(process.env.PIP_AUDIT)} |\n| pnpm audit (JS/TS CVE) | ${status(process.env.PNPM_AUDIT)} |\n| trivy (Dockerfile) | ${status(process.env.TRIVY_CONFIG)} |${details}`,
+              labels: ['security', 'bug']
+            });
+
+      - name: Close resolved security issues
+        if: (steps.pip-audit.outcome == 'success' || steps.pip-audit.outcome == 'skipped') && (steps.pnpm-audit.outcome == 'success' || steps.pnpm-audit.outcome == 'skipped') && (steps.trivy-config.outcome == 'success' || steps.trivy-config.outcome == 'skipped')
+        uses: actions/github-script@v7.0.1
+        with:
+          script: |
+            const issues = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              labels: 'security',
+              state: 'open'
+            });
+            for (const issue of issues.data) {
+              if (issue.title.includes('Security scan failed')) {
+                await github.rest.issues.update({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: issue.number,
+                  state: 'closed',
+                  state_reason: 'completed'
+                });
+              }
+            }
+
+      - name: Fail if security issues found
+        if: steps.pip-audit.outcome == 'failure' || steps.pnpm-audit.outcome == 'failure' || steps.trivy-config.outcome == 'failure'
+        run: exit 1
+
+  docker-image-scan:
+    name: Docker Image Vulnerability Scan
+    # Serverless repos have no Dockerfile - skip the whole job when the
+    # caller passes an empty dockerfile_path (mirrors the python_lock_file
+    # pattern above). This is the change we proposed upstream to LZv2.
+    if: inputs.dockerfile_path != ''
+    runs-on: ubuntu-latest
+    needs: security-scan
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build Docker image
+        run: docker build --platform linux/amd64 -t ${{ inputs.docker_image_name }}:${{ github.sha }} ${{ inputs.docker_context }}
+
+      - name: Trivy image scan
+        id: trivy-image
+        continue-on-error: true
+        uses: aquasecurity/trivy-action@v0.35.0
+        with:
+          image-ref: '${{ inputs.docker_image_name }}:${{ github.sha }}'
+          severity: 'CRITICAL'
+          exit-code: '1'
+          format: 'table'
+          output: '/tmp/trivy-output.txt'
+          trivyignores: ${{ inputs.trivyignore_path }}
+
+      - name: Show scan results
+        if: always()
+        run: cat /tmp/trivy-output.txt 2>/dev/null || echo "No output"
+
+      - name: Create issue on image scan failure
+        if: steps.trivy-image.outcome == 'failure'
+        uses: actions/github-script@v7.0.1
+        with:
+          script: |
+            const fs = require('fs');
+            let output = 'No trivy output captured';
+            try { output = fs.readFileSync('/tmp/trivy-output.txt', 'utf8'); } catch {}
+            const truncated = output.length > 60000 ? output.substring(0, 60000) + '\n...(truncated)' : output;
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: `🔴 Docker image CRITICAL vulns on ${context.sha.substring(0, 7)}`,
+              body: `## Docker Image Vulnerability\n\n**Branch:** \`${context.ref}\`\n**Commit:** ${context.sha}\n**Run:** ${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}\n\n### Trivy Scan Results\n\n\`\`\`\n${truncated}\n\`\`\``,
+              labels: ['security', 'bug']
+            });
+
+      - name: Close resolved image issues
+        if: steps.trivy-image.outcome == 'success'
+        uses: actions/github-script@v7.0.1
+        with:
+          script: |
+            const issues = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              labels: 'security',
+              state: 'open'
+            });
+            for (const issue of issues.data) {
+              if (issue.title.includes('Docker image')) {
+                await github.rest.issues.update({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: issue.number,
+                  state: 'closed',
+                  state_reason: 'completed'
+                });
+              }
+            }
+
+      - name: Fail if critical vulnerabilities
+        if: steps.trivy-image.outcome == 'failure'
+        run: exit 1

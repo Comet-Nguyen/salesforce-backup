@@ -37,6 +37,13 @@ Parameters:
   SalesforceUsername:
     Type: String
 
+  SalesforceEcaFullName:
+    Type: String
+    Default: SF_Backup_S3
+    Description: >-
+      fullName of the ExtlClntAppGlobalOauthSettings component whose
+      certificate the rotation function manages
+
   SalesforceLoginUrl:
     Type: String
     Description: Customer My Domain URL, e.g. https://customer.my.salesforce.com
@@ -97,19 +104,26 @@ Resources:
     Type: AWS::Serverless::Function
     Properties:
       FunctionName: !Sub salesforce-backup-rotation-${EnvironmentName}
-      # Semi-automated JWT rotation: createSecret generates a new RSA keypair;
-      # setSecret publishes the new public cert via SNS for the SF admin to
-      # upload; testSecret verifies JWT auth with the pending key (retried by
-      # Secrets Manager until the cert is uploaded); finishSecret finalizes.
-      Description: Semi-automated 90-day JWT key rotation for the backup secret
+      # Fully-automated JWT rotation via Salesforce Metadata API:
+      # createSecret generates RSA-2048 + self-signed cert (AWSPENDING);
+      # setSecret deploys the cert to ExtlClntAppGlobalOauthSettings.certificate
+      # (single slot: old key dies on deploy; rollback = redeploy old cert via
+      # the pre-swap session, which survives the change); testSecret verifies
+      # the new key end-to-end; finishSecret promotes AWSCURRENT + SNS notify.
+      # Org prerequisites: "Allow Access to OAuth Consumer Secrets via Metadata
+      # API" enabled + integration user has the consumer-secrets-in-metadata
+      # permission. Schedule rotation AWAY from the 01:00 UTC backup window.
+      Description: Fully-automated 90-day JWT cert rotation via Metadata API
       Handler: rotation_function.lambda_handler
       CodeUri: src/rotation/
-      Timeout: 60
+      Timeout: 120        # Metadata read + deploy + verify + potential rollback
       Environment:
         Variables:
           SNS_TOPIC_ARN: !Ref BackupAlertsTopic
           SF_LOGIN_URL: !Ref SalesforceLoginUrl
           SF_USERNAME: !Ref SalesforceUsername
+          SF_ECA_FULLNAME: !Ref SalesforceEcaFullName
+          METADATA_API_VERSION: "62.0"
       Policies:
         - Statement:
             - Sid: RotateThisSecretOnly
@@ -136,12 +150,16 @@ Resources:
   # --------------------------------------------------------------------------
   # Backup function - ENCRYPT-ONLY by design
   # --------------------------------------------------------------------------
+  # Worker Lambda for the Step Functions state machine. step_handler
+  # dispatches on event["action"]: discover / export_object / export_pardot /
+  # aggregate. Same codebase and the same encrypt-only SoD role as before -
+  # the orchestrator changes, the security posture does not.
   BackupFunction:
     Type: AWS::Serverless::Function
     Properties:
       FunctionName: !Sub salesforce-backup-${EnvironmentName}
-      Description: Exports Salesforce objects to S3 (write-only, cannot read backups back)
-      Handler: salesforce_backup.lambda_handler
+      Description: SFN worker - exports Salesforce objects to S3 (write-only)
+      Handler: salesforce_backup.step_handler
       CodeUri: src/backup/
       Timeout: 900
       EphemeralStorage:
@@ -163,14 +181,6 @@ Resources:
           PARDOT_CLIENT_ID: skip
           PARDOT_BUSINESS_UNIT_ID: skip
           PARDOT_INCLUDE_HIGH_VOLUME: 'false'
-      Events:
-        DailySchedule:
-          Type: Schedule
-          Properties:
-            Name: !Sub salesforce-backup-daily-${EnvironmentName}
-            Schedule: !Ref BackupScheduleCron
-            RetryPolicy:
-              MaximumRetryAttempts: 2
       Policies:
         - Statement:
             # ---- SoD core: WRITE-ONLY data path ----
@@ -231,7 +241,152 @@ Resources:
       AlarmActions:
         - !Ref BackupAlertsTopic
 
+  # --------------------------------------------------------------------------
+  # Step Functions orchestrator (Architect decision): discover -> parallel
+  # [Map over objects | Pardot branch] -> aggregate. Per-object status is
+  # visible in the execution graph AND in execution_log_*.json on S3.
+  # --------------------------------------------------------------------------
+  BackupStateMachine:
+    Type: AWS::Serverless::StateMachine
+    Properties:
+      Name: !Sub salesforce-backup-${EnvironmentName}
+      Type: STANDARD
+      DefinitionSubstitutions:
+        WorkerArn: !GetAtt BackupFunction.Arn
+      Events:
+        DailySchedule:
+          Type: Schedule
+          Properties:
+            Name: !Sub salesforce-backup-sfn-daily-${EnvironmentName}
+            Schedule: !Ref BackupScheduleCron
+            # step_handler's discover treats null mode as "decide by weekday"
+            # (Saturday = full). The key MUST exist: the state machine reads
+            # $.mode via JSONPath, which fails on a missing key.
+            Input: '{"mode": null}'
+            RetryPolicy:
+              MaximumRetryAttempts: 2
+      Policies:
+        - LambdaInvokePolicy:
+            FunctionName: !Ref BackupFunction
+      Definition:
+        Comment: "Salesforce -> S3 backup: discover, fan-out exports, aggregate"
+        StartAt: Discover
+        TimeoutSeconds: 7200
+        States:
+          Discover:
+            Type: Task
+            Resource: "${WorkerArn}"
+            Parameters:
+              action: discover
+              "mode.$": "$.mode"
+            Retry:
+              - ErrorEquals: [Lambda.ServiceException, Lambda.TooManyRequestsException, Lambda.SdkClientException]
+                IntervalSeconds: 5
+                MaxAttempts: 3
+                BackoffRate: 2
+              - ErrorEquals: [States.TaskFailed]
+                IntervalSeconds: 60
+                MaxAttempts: 3
+                BackoffRate: 2
+                Comment: Transient Salesforce errors - discover is idempotent
+            Next: ExportAll
+          ExportAll:
+            Type: Parallel
+            ResultPath: "$.branches"
+            Branches:
+              - StartAt: ExportObjects
+                States:
+                  ExportObjects:
+                    Type: Map
+                    ItemsPath: "$.objects"
+                    MaxConcurrency: 6
+                    Parameters:
+                      action: export_object
+                      "object_name.$": "$$.Map.Item.Value"
+                      "meta.$": "$.meta"
+                    Iterator:
+                      StartAt: ExportOne
+                      States:
+                        ExportOne:
+                          Type: Task
+                          Resource: "${WorkerArn}"
+                          Retry:
+                            - ErrorEquals: [Lambda.ServiceException, Lambda.TooManyRequestsException, Lambda.SdkClientException]
+                              IntervalSeconds: 5
+                              MaxAttempts: 3
+                              BackoffRate: 2
+                          Catch:
+                            - ErrorEquals: [States.ALL]
+                              ResultPath: "$.platform_error"
+                              Next: MarkFailed
+                          End: true
+                        MarkFailed:
+                          Type: Pass
+                          Parameters:
+                            "object_name.$": "$.object_name"
+                            status: failed
+                            row_count: 0
+                            s3_key: null
+                            file_size_bytes: 0
+                            error: Lambda invocation failed after retries
+                            used_bulk: false
+                          End: true
+                    End: true
+              - StartAt: ExportPardot
+                States:
+                  ExportPardot:
+                    Type: Task
+                    Resource: "${WorkerArn}"
+                    Parameters:
+                      action: export_pardot
+                      "pardot_enabled.$": "$.pardot_enabled"
+                      "pardot_endpoints.$": "$.pardot_endpoints"
+                      "meta.$": "$.meta"
+                    Retry:
+                      - ErrorEquals: [Lambda.ServiceException, Lambda.TooManyRequestsException, Lambda.SdkClientException]
+                        IntervalSeconds: 5
+                        MaxAttempts: 3
+                        BackoffRate: 2
+                    Catch:
+                      - ErrorEquals: [States.ALL]
+                        ResultPath: "$.platform_error"
+                        Next: PardotFailed
+                    End: true
+                  PardotFailed:
+                    Type: Pass
+                    Result:
+                      - object_name: pardot_branch
+                        status: failed
+                        row_count: 0
+                        s3_key: null
+                        file_size_bytes: 0
+                        error: Pardot Lambda invocation failed after retries
+                    End: true
+            Next: Aggregate
+          Aggregate:
+            Type: Task
+            Resource: "${WorkerArn}"
+            Parameters:
+              action: aggregate
+              "meta.$": "$.meta"
+              "sf_results.$": "$.branches[0]"
+              "pardot_results.$": "$.branches[1]"
+            Retry:
+              - ErrorEquals: [Lambda.ServiceException, Lambda.TooManyRequestsException, Lambda.SdkClientException]
+                IntervalSeconds: 5
+                MaxAttempts: 3
+                BackoffRate: 2
+              - ErrorEquals: [States.TaskFailed]
+                IntervalSeconds: 30
+                MaxAttempts: 2
+                BackoffRate: 2
+            End: true
+
 Outputs:
+
+  StateMachineArn:
+    Description: Step Functions state machine orchestrating the backup
+    Value: !Ref BackupStateMachine
 
   BackupFunctionName:
     Value: !Ref BackupFunction
