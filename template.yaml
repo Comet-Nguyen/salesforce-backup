@@ -94,6 +94,12 @@ Resources:
 
   SecretRotationSchedule:
     Type: AWS::SecretsManager::RotationSchedule
+    # Explicit dependency: without it CloudFormation may create this before
+    # RotationInvokePermission finishes attaching to the Lambda's resource
+    # policy, and Secrets Manager's own invoke attempt during schedule
+    # creation fails with AccessDenied - a race, not a permissions gap
+    # (the permission is correct; the ordering was not guaranteed).
+    DependsOn: RotationInvokePermission
     Properties:
       SecretId: !Ref BackupSecret
       RotationRules:
@@ -257,6 +263,10 @@ Resources:
         DailySchedule:
           Type: Schedule
           Properties:
+            # Distinct from the old Lambda-schedule rule name: during the
+            # Lambda -> Step Functions migration CloudFormation creates the
+            # new rule BEFORE deleting the old one, so reusing the name fails
+            # with "already exists".
             Name: !Sub salesforce-backup-sfn-daily-${EnvironmentName}
             Schedule: !Ref BackupScheduleCron
             # step_handler's discover treats null mode as "decide by weekday"
