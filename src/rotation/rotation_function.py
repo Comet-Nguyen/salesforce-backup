@@ -36,6 +36,9 @@ import datetime
 import json
 import logging
 import os
+from email.mime.application import MIMEApplication
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
 
 import boto3
 import jwt  # PyJWT[crypto]
@@ -56,10 +59,24 @@ SF_ECA_FULLNAME = os.environ.get("SF_ECA_FULLNAME", "SF_Backup_S3")
 SNS_TOPIC_ARN = os.environ.get("SNS_TOPIC_ARN", "")
 CERT_VALIDITY_DAYS = int(os.environ.get("CERT_VALIDITY_DAYS", "365"))
 
+# SES delivers the certificate as a real .crt attachment - SNS email is
+# plain-text only and cannot carry attachments. Both must be set for the
+# attachment email to send; if either is missing, set_secret falls back to
+# an SNS text notice with the cert pasted inline (degraded but not silent).
+SES_SENDER_EMAIL = os.environ.get("SES_SENDER_EMAIL", "")
+ALERT_EMAIL_ADDRESS = os.environ.get("ALERT_EMAIL_ADDRESS", "")
+
 # Field names - single source of truth, must match salesforce_backup.py
 F_CONSUMER_KEY = "sf_consumer_key"
 F_PRIVATE_KEY = "sf_jwt_private_key"
 F_PENDING_CERT = "_pending_public_cert"
+
+# Secret tag used to make setSecret's notification idempotent: Secrets
+# Manager retries an INCOMPLETE rotation on its own schedule (testSecret
+# keeps failing until the certificate is uploaded by hand), and each retry
+# re-invokes setSecret. Without this guard, every retry would resend the
+# certificate email.
+TAG_NOTIFIED_VERSION = "CertNotifiedForVersion"
 
 _clients: dict = {}
 
@@ -72,6 +89,8 @@ def _client(name: str):
 
 
 def notify(subject: str, message: str) -> None:
+    """Plain-text SNS notice. Used for completion/rollback alerts, which
+    happen once at a terminal state and need no attachment."""
     logger.info("NOTIFY: %s", subject)
     if SNS_TOPIC_ARN:
         try:
@@ -80,6 +99,85 @@ def notify(subject: str, message: str) -> None:
             )
         except Exception:
             logger.exception("SNS publish failed (continuing)")
+
+
+def send_cert_email(cert_pem: str) -> None:
+    """Deliver the new certificate as a real .crt attachment via SES.
+
+    SNS email is plain text only - it cannot carry attachments, which is
+    why the certificate was previously pasted inline as text. Falls back to
+    an SNS text notice (cert inline) if SES sender/recipient are not
+    configured, so the admin still gets *something* rather than silence.
+    """
+    if not (SES_SENDER_EMAIL and ALERT_EMAIL_ADDRESS):
+        logger.warning(
+            "SES_SENDER_EMAIL or ALERT_EMAIL_ADDRESS not set - falling back "
+            "to SNS text notice with the certificate pasted inline"
+        )
+        notify(
+            f"ACTION REQUIRED: upload new certificate for {SF_ECA_FULLNAME}",
+            f"SES not configured, sending certificate inline instead of as "
+            f"an attachment.\n\n{cert_pem}",
+        )
+        return
+
+    msg = MIMEMultipart()
+    msg["Subject"] = f"ACTION REQUIRED: upload new certificate for {SF_ECA_FULLNAME}"
+    msg["From"] = SES_SENDER_EMAIL
+    msg["To"] = ALERT_EMAIL_ADDRESS
+    msg.attach(
+        MIMEText(
+            f"""A new JWT keypair has been generated for the Salesforce backup.
+
+The OLD key still works - backups are unaffected until you complete step 1.
+
+STEP 1 - Upload the attached certificate ({SF_ECA_FULLNAME}.crt) in Salesforce Setup:
+  External Client App Manager -> {SF_ECA_FULLNAME} -> OAuth Settings
+  -> Use digital signatures -> upload the attached certificate.
+
+STEP 2 - Complete the rotation (AWS CLI), immediately after step 1:
+  aws secretsmanager rotate-secret --secret-id <this secret's ARN>
+
+This re-verifies the new key and promotes it. Until step 2 runs, the
+backup keeps using the old key, which stops working the moment step 1
+replaces the certificate.
+"""
+        )
+    )
+    attachment = MIMEApplication(cert_pem.encode(), _subtype="x-x509-ca-cert")
+    attachment.add_header(
+        "Content-Disposition", "attachment", filename=f"{SF_ECA_FULLNAME}.crt"
+    )
+    msg.attach(attachment)
+
+    try:
+        _client("ses").send_raw_email(
+            Source=SES_SENDER_EMAIL,
+            Destinations=[ALERT_EMAIL_ADDRESS],
+            RawMessage={"Data": msg.as_string()},
+        )
+        logger.info("send_cert_email: certificate delivered as .crt attachment via SES")
+    except Exception:
+        logger.exception("SES send failed - falling back to SNS text notice")
+        notify(
+            f"ACTION REQUIRED: upload new certificate for {SF_ECA_FULLNAME}",
+            f"SES delivery failed, sending certificate inline instead.\n\n{cert_pem}",
+        )
+
+
+def _already_notified(arn: str, token: str) -> bool:
+    """True if setSecret already sent the certificate email for this
+    AWSPENDING version. Secrets Manager retries an incomplete rotation on
+    its own schedule, and each retry re-invokes setSecret - without this
+    guard every retry would resend the same email."""
+    tags = _client("secretsmanager").describe_secret(SecretId=arn).get("Tags", []) or []
+    return any(t["Key"] == TAG_NOTIFIED_VERSION and t["Value"] == token for t in tags)
+
+
+def _mark_notified(arn: str, token: str) -> None:
+    _client("secretsmanager").tag_resource(
+        SecretId=arn, Tags=[{"Key": TAG_NOTIFIED_VERSION, "Value": token}]
+    )
 
 
 def jwt_login(consumer_key: str, private_key_pem: str) -> dict:
@@ -173,33 +271,25 @@ def create_secret(arn: str, token: str) -> None:
 
 
 def set_secret(arn: str, token: str) -> None:
-    """Hand the new PUBLIC certificate to the admin. Salesforce is untouched."""
+    """Hand the new PUBLIC certificate to the admin. Salesforce is untouched.
+
+    Idempotent: Secrets Manager retries an incomplete rotation on its own
+    schedule (testSecret keeps failing until the admin uploads the cert),
+    and each retry re-invokes setSecret. Skip re-sending if this token's
+    certificate email already went out.
+    """
+    if _already_notified(arn, token):
+        logger.info(
+            "setSecret: certificate email already sent for this version - "
+            "skipping duplicate (rotation is waiting on the manual upload)"
+        )
+        return
+
     pending = get_secret_dict(arn, "AWSPENDING", token)
     cert_pem = pending[F_PENDING_CERT]
 
-    notify(
-        f"ACTION REQUIRED: upload new certificate for {SF_ECA_FULLNAME}",
-        f"""A new JWT keypair has been generated for the Salesforce backup.
-
-The OLD key still works - backups are unaffected until you complete step 1.
-
-STEP 1 - Upload the certificate (Salesforce Setup)
-  External Client App Manager -> {SF_ECA_FULLNAME} -> OAuth Settings
-  -> Use digital signatures -> upload the certificate below.
-
-STEP 2 - Complete the rotation (AWS CLI)
-  aws secretsmanager rotate-secret --secret-id {arn}
-
-  This re-runs the rotation, which will now verify the new key and promote
-  it to AWSCURRENT. Until you do this, the backup keeps using the old key,
-  which stops working the moment step 1 replaces the certificate - so run
-  step 2 immediately after step 1.
-
-Certificate to upload (public - safe to email):
-
-{cert_pem}
-""",
-    )
+    send_cert_email(cert_pem)
+    _mark_notified(arn, token)
     logger.info("setSecret: certificate published for manual upload")
 
 
@@ -246,13 +336,28 @@ def finish_secret(arn: str, token: str) -> None:
         MoveToVersionId=token,
         RemoveFromVersionId=current_version,
     )
+
+    # Moving AWSCURRENT does NOT auto-remove AWSPENDING from the same
+    # version - the two labels are independent API calls. Without this,
+    # the promoted version stays tagged AWSPENDING forever (confirmed
+    # against a documented gap in AWS's own rotation-lambda samples,
+    # aws-samples/aws-secrets-manager-rotation-lambdas#168).
+    try:
+        _client("secretsmanager").update_secret_version_stage(
+            SecretId=arn, VersionStage="AWSPENDING", RemoveFromVersionId=token
+        )
+    except _client("secretsmanager").exceptions.InvalidParameterException:
+        # AWSPENDING was already absent (e.g. a resumed/manual finishSecret
+        # call) - nothing to remove, not an error.
+        logger.info("finishSecret: AWSPENDING already absent on this version")
+
     notify(
         f"Rotation completed for {SF_ECA_FULLNAME}",
         f"The new JWT private key is now AWSCURRENT for {arn}.\n\n"
         f"The previous key is retained as AWSPREVIOUS but no longer works: the "
         f"certificate it matched has been replaced in Salesforce.",
     )
-    logger.info("finishSecret: new key promoted to AWSCURRENT")
+    logger.info("finishSecret: new key promoted to AWSCURRENT, AWSPENDING cleared")
 
 
 def lambda_handler(event, context):

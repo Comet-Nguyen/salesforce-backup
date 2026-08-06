@@ -46,14 +46,25 @@ Parameters:
       Days between automatic secret rotations. PRD must stay at 90 (CISO
       requirement); the lab sets 1 to exercise the rotation path quickly.
 
+  SesSenderEmail:
+    Type: String
+    # Lab-only hardcode (matches Config.LAB_EMAIL in salesforce_backup_lab.py) -
+    # not a secret, so no GitHub variable needed. Must be an SES-verified
+    # identity in this account/region.
+    Default: "nhikhanh28@gmail.com"
+    Description: >-
+      SES-verified sender address for the rotation function's certificate
+      email (MIME attachment - requires ses:SendRawEmail).
+
   AlertEmailAddress:
     Type: String
-    Default: ""
+    # Recipient for the SES certificate-attachment email. NOT used to
+    # auto-create an SNS subscription (that is done manually via
+    # `aws sns subscribe` + confirming the email, by design - see README).
+    Default: "nhikhanh28@gmail.com"
     Description: >-
-      Email to subscribe to BackupAlertsTopic (rotation notices, export
-      failures, volume anomalies). Leave empty to skip - subscribe manually
-      with `aws sns subscribe` instead. Must be confirmed via the email AWS
-      sends before any alert is actually delivered.
+      Recipient for rotation's certificate-attachment email. SNS Topic
+      subscriptions are managed manually, not via this template.
 
   SalesforceEcaFullName:
     Type: String
@@ -82,9 +93,6 @@ Globals:
 # ============================================================================
 # RESOURCES
 # ============================================================================
-Conditions:
-  HasAlertEmail: !Not [!Equals [!Ref AlertEmailAddress, ""]]
-
 Resources:
 
   # --------------------------------------------------------------------------
@@ -95,17 +103,6 @@ Resources:
     Properties:
       TopicName: !Sub salesforce-backup-alerts-${EnvironmentName}
 
-  # Optional: wire an email subscription at deploy time so alerts (including
-  # rotation notifications) reach someone without a manual `aws sns subscribe`
-  # step. NOTE: email subscriptions start PendingConfirmation - the address
-  # must click the confirmation link AWS sends before any message arrives.
-  BackupAlertsEmailSubscription:
-    Type: AWS::SNS::Subscription
-    Condition: HasAlertEmail
-    Properties:
-      TopicArn: !Ref BackupAlertsTopic
-      Protocol: email
-      Endpoint: !Ref AlertEmailAddress
 
   # --------------------------------------------------------------------------
   # Secrets Manager - credentials with 90-day rotation
@@ -167,6 +164,8 @@ Resources:
           SF_LOGIN_URL: !Ref SalesforceLoginUrl
           SF_USERNAME: !Ref SalesforceUsername
           SF_ECA_FULLNAME: !Ref SalesforceEcaFullName
+          SES_SENDER_EMAIL: !Ref SesSenderEmail
+          ALERT_EMAIL_ADDRESS: !Ref AlertEmailAddress
       Policies:
         - Statement:
             - Sid: RotateThisSecretOnly
@@ -176,11 +175,21 @@ Resources:
                 - secretsmanager:PutSecretValue
                 - secretsmanager:DescribeSecret
                 - secretsmanager:UpdateSecretVersionStage
+                # TagResource: idempotency marker (CertNotifiedForVersion) so
+                # a retried, still-incomplete rotation does not resend the
+                # certificate email on every retry.
+                - secretsmanager:TagResource
               Resource: !Ref BackupSecret
             - Sid: NotifyAdmin
               Effect: Allow
               Action: sns:Publish
               Resource: !Ref BackupAlertsTopic
+            - Sid: SendCertEmail
+              Effect: Allow
+              # SendRawEmail (not SendEmail) is required for MIME attachments -
+              # this is how the certificate is delivered as a real .crt file.
+              Action: ses:SendRawEmail
+              Resource: !Sub arn:aws:ses:${AWS::Region}:${AWS::AccountId}:identity/*
 
   RotationInvokePermission:
     Type: AWS::Lambda::Permission
