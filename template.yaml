@@ -39,12 +39,14 @@ Parameters:
 
   RotationIntervalDays:
     Type: Number
-    Default: 90
+    Default: 180
     MinValue: 1
     MaxValue: 365
     Description: >-
-      Days between automatic secret rotations. PRD must stay at 90 (CISO
-      requirement); the lab sets 1 to exercise the rotation path quickly.
+      Days between automatic secret rotations. PRD must stay at 180 (CISO
+      confirmed - supersedes the 90-day figure in the original
+      SecurityRequirements doc); the lab sets 1 to exercise the rotation
+      path quickly.
 
   SesSenderEmail:
     Type: String
@@ -166,6 +168,11 @@ Resources:
           SF_ECA_FULLNAME: !Ref SalesforceEcaFullName
           SES_SENDER_EMAIL: !Ref SesSenderEmail
           ALERT_EMAIL_ADDRESS: !Ref AlertEmailAddress
+          # Built via Sub, NOT via Ref/GetAtt to the Events.PollRotation
+          # source below - referencing that resource's logical ID here
+          # would create a circular dependency (function -> rule -> function).
+          # Must stay in sync with the Schedule event's Name: property.
+          POLL_RULE_NAME: !Sub salesforce-backup-rotation-poll-${EnvironmentName}
       Policies:
         - Statement:
             - Sid: RotateThisSecretOnly
@@ -190,6 +197,35 @@ Resources:
               # this is how the certificate is delivered as a real .crt file.
               Action: ses:SendRawEmail
               Resource: !Sub arn:aws:ses:${AWS::Region}:${AWS::AccountId}:identity/*
+            - Sid: SelfTriggerRotation
+              Effect: Allow
+              # Lets the poll target re-invoke rotate-secret while a
+              # rotation is waiting on the manual certificate upload.
+              Action: secretsmanager:RotateSecret
+              Resource: !Ref BackupSecret
+            - Sid: TogglePollRule
+              Effect: Allow
+              Action:
+                - events:EnableRule
+                - events:DisableRule
+              Resource: !Sub arn:aws:events:${AWS::Region}:${AWS::AccountId}:rule/salesforce-backup-rotation-poll-${EnvironmentName}
+      Events:
+        # Self-triggered re-attempt while a rotation is waiting on the
+        # manual certificate upload. Starts DISABLED - setSecret enables it
+        # the moment a rotation begins waiting; finishSecret disables it
+        # again once the rotation completes. Safe at any cadence since every
+        # step in the 4-step flow is idempotent; 30 minutes balances
+        # responsiveness against needless API calls over a 180-day cycle.
+        PollRotation:
+          Type: Schedule
+          Properties:
+            Name: !Sub salesforce-backup-rotation-poll-${EnvironmentName}
+            Description: >-
+              Re-attempts rotate-secret while waiting on a manual certificate
+              upload. Enabled/disabled by the rotation function itself.
+            Schedule: rate(30 minutes)
+            Enabled: false
+            Input: !Sub '{"Action": "poll_rotation", "SecretArn": "${BackupSecret}"}'
 
   RotationInvokePermission:
     Type: AWS::Lambda::Permission
