@@ -1,172 +1,98 @@
-"""Secrets Manager rotation function - Salesforce JWT private key (90-day).
+"""Secrets Manager rotation Lambda - JWT key rotation, MANUAL certificate upload.
 
-Semi-automated by necessity: a JWT keypair rotation is only complete when the
-NEW PUBLIC CERTIFICATE has been uploaded to the Salesforce External Client
-App, which no AWS service can do on its own. The standard 4-step rotation
-protocol is used, with the human step embedded in the retry loop:
+Design decision (Salesforce team): the public certificate is uploaded to the
+External Client App by hand, not deployed through the Metadata API. Rotation is
+therefore a TWO-PHASE process, and the first pass is EXPECTED to stop at
+testSecret:
 
-  createSecret : generate a new RSA-2048 keypair; store the full secret JSON
-                 (new private key, all other fields carried over) as the
-                 AWSPENDING version.
-  setSecret    : publish the new PUBLIC certificate (PEM) to SNS so the
-                 Salesforce admin can upload it to the External Client App.
-                 Idempotent - re-notifies on retries.
-  testSecret   : attempt a real JWT OAuth token exchange against Salesforce
-                 using the PENDING private key. FAILS until the admin has
-                 uploaded the cert - Secrets Manager automatically retries
-                 the rotation over the following hours, so this failure is
-                 the designed "wait for human" gate, not an error.
-  finishSecret : promote AWSPENDING to AWSCURRENT. The backup function picks
-                 up the new key on its next run (SecretsStore reads at
-                 runtime, no cache across invocations).
+  Phase 1 - automatic, on schedule
+    createSecret : generate RSA-2048 + self-signed X.509 (365d) -> AWSPENDING
+    setSecret    : publish the new PUBLIC certificate over SNS for the admin.
+                   Salesforce is NOT touched here - nothing to roll back.
+    testSecret   : JWT auth with the pending key -> FAILS while the old
+                   certificate is still the one installed. This failure is the
+                   designed hand-off point, not a defect.
 
-The old certificate should be removed from the External Client App after one
-successful backup run on the new key.
+  Phase 2 - after the admin uploads the certificate in Setup
+    Re-trigger:  aws secretsmanager rotate-secret --secret-id <arn>
+    testSecret   : now succeeds
+    finishSecret : promote AWSPENDING -> AWSCURRENT, notify
+
+Why this ordering is safe: the OLD private key keeps working until the moment
+the admin replaces the certificate in Salesforce, so backups never break
+mid-rotation. The window of exposure is between the manual upload and
+finishSecret promoting the new key - keep it short by re-triggering promptly.
+
+Secret JSON (field names MUST match salesforce_backup.py exactly):
+  {
+    "sf_consumer_key":    "...",             # unchanged by rotation
+    "sf_jwt_private_key": "-----BEGIN ...",  # ROTATED
+    "_pending_public_cert": "-----BEGIN CERTIFICATE-----..."   # work field
+  }
+Any other keys (pardot_*) are carried through untouched.
 """
 
+import datetime
 import json
 import logging
 import os
-import time
 
 import boto3
-import jwt
+import jwt  # PyJWT[crypto]
 import requests
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.x509.oid import NameOID
-from datetime import datetime, timedelta, timezone
 
-logging.basicConfig(level="INFO", force=True)
-logger = logging.getLogger("rotation")
+logging.basicConfig(
+    level=logging.INFO, force=True
+)  # force: Lambda pre-configures handlers
+logger = logging.getLogger(__name__)
 
-SNS_TOPIC_ARN = os.environ["SNS_TOPIC_ARN"]
-SF_LOGIN_URL = os.environ["SF_LOGIN_URL"]
+SF_LOGIN_URL = os.environ.get("SF_LOGIN_URL", "https://login.salesforce.com")
 SF_USERNAME = os.environ["SF_USERNAME"]
+SF_ECA_FULLNAME = os.environ.get("SF_ECA_FULLNAME", "SF_Backup_S3")
+SNS_TOPIC_ARN = os.environ.get("SNS_TOPIC_ARN", "")
+CERT_VALIDITY_DAYS = int(os.environ.get("CERT_VALIDITY_DAYS", "365"))
+
+# Field names - single source of truth, must match salesforce_backup.py
+F_CONSUMER_KEY = "sf_consumer_key"
+F_PRIVATE_KEY = "sf_jwt_private_key"
+F_PENDING_CERT = "_pending_public_cert"
+
+_clients: dict = {}
 
 
-def lambda_handler(event, context):  # noqa: ANN001, ARG001
-    arn = event["SecretId"]
-    token = event["ClientRequestToken"]
-    step = event["Step"]
-    sm = boto3.client("secretsmanager")
-
-    metadata = sm.describe_secret(SecretId=arn)
-    versions = metadata.get("VersionIdsToStages", {})
-    if token not in versions:
-        raise ValueError(f"Version {token} not found for secret {arn}")
-    if "AWSCURRENT" in versions[token]:
-        logger.info("Version %s already AWSCURRENT - nothing to do", token)
-        return
-    if "AWSPENDING" not in versions[token]:
-        raise ValueError(f"Version {token} not staged AWSPENDING for {arn}")
-
-    if step == "createSecret":
-        _create_secret(sm, arn, token)
-    elif step == "setSecret":
-        _set_secret(sm, arn, token)
-    elif step == "testSecret":
-        _test_secret(sm, arn, token)
-    elif step == "finishSecret":
-        _finish_secret(sm, arn, token)
-    else:
-        raise ValueError(f"Unknown rotation step: {step}")
+def _client(name: str):
+    """Lazy, cached boto3 clients - keeps cold starts lean and imports testable."""
+    if name not in _clients:
+        _clients[name] = boto3.client(name)
+    return _clients[name]
 
 
-def _create_secret(sm, arn: str, token: str) -> None:
-    """Generate a new keypair; carry every non-key field over unchanged."""
-    try:
-        sm.get_secret_value(SecretId=arn, VersionId=token, VersionStage="AWSPENDING")
-        logger.info("createSecret: pending version already exists - idempotent skip")
-        return
-    except sm.exceptions.ResourceNotFoundException:
-        pass
-
-    current = json.loads(
-        sm.get_secret_value(SecretId=arn, VersionStage="AWSCURRENT")["SecretString"]
-    )
-
-    private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
-    private_pem = private_key.private_bytes(
-        encoding=serialization.Encoding.PEM,
-        format=serialization.PrivateFormat.PKCS8,
-        encryption_algorithm=serialization.NoEncryption(),
-    ).decode()
-
-    # Self-signed cert for the Salesforce External Client App (JWT Bearer)
-    subject = issuer = x509.Name(
-        [x509.NameAttribute(NameOID.COMMON_NAME, "sf-backup-rotated")]
-    )
-    cert = (
-        x509.CertificateBuilder()
-        .subject_name(subject)
-        .issuer_name(issuer)
-        .public_key(private_key.public_key())
-        .serial_number(x509.random_serial_number())
-        .not_valid_before(datetime.now(timezone.utc))
-        .not_valid_after(datetime.now(timezone.utc) + timedelta(days=180))
-        .sign(private_key, hashes.SHA256())
-    )
-    cert_pem = cert.public_bytes(serialization.Encoding.PEM).decode()
-
-    pending = dict(current)
-    pending["sf_jwt_private_key"] = private_pem
-    pending["_pending_public_cert"] = cert_pem  # consumed by setSecret notification
-
-    sm.put_secret_value(
-        SecretId=arn,
-        ClientRequestToken=token,
-        SecretString=json.dumps(pending),
-        VersionStages=["AWSPENDING"],
-    )
-    logger.info("createSecret: new RSA-2048 keypair staged as AWSPENDING")
+def notify(subject: str, message: str) -> None:
+    logger.info("NOTIFY: %s", subject)
+    if SNS_TOPIC_ARN:
+        try:
+            _client("sns").publish(
+                TopicArn=SNS_TOPIC_ARN, Subject=subject[:100], Message=message
+            )
+        except Exception:
+            logger.exception("SNS publish failed (continuing)")
 
 
-def _set_secret(sm, arn: str, token: str) -> None:
-    """Human gate: send the new public cert to the Salesforce admin."""
-    pending = json.loads(
-        sm.get_secret_value(SecretId=arn, VersionId=token, VersionStage="AWSPENDING")[
-            "SecretString"
-        ]
-    )
-    cert_pem = pending.get("_pending_public_cert", "")
-    boto3.client("sns").publish(
-        TopicArn=SNS_TOPIC_ARN,
-        Subject="[ACTION REQUIRED] Salesforce backup JWT key rotation - upload new certificate",
-        Message=(
-            "A 90-day rotation of the Salesforce backup JWT key has started.\n\n"
-            "ACTION: upload the certificate below to the External Client App\n"
-            "(App Manager > SF_Backup_S3 > Settings > JWT Bearer Flow > Certificate),\n"
-            "keeping the OLD certificate in place until rotation completes.\n\n"
-            "Rotation will verify automatically and finalize once the cert is live.\n"
-            "Remove the old certificate after the next successful backup run.\n\n"
-            f"{cert_pem}"
-        ),
-    )
-    logger.info("setSecret: admin notified with new public certificate")
-
-
-def _test_secret(sm, arn: str, token: str) -> None:
-    """Real JWT auth with the PENDING key. Failure here is the designed
-    wait-for-human gate - Secrets Manager retries until the cert is uploaded."""
-    pending = json.loads(
-        sm.get_secret_value(SecretId=arn, VersionId=token, VersionStage="AWSPENDING")[
-            "SecretString"
-        ]
-    )
-    consumer_key = pending.get("sf_consumer_key", "").strip()
-    if not consumer_key:
-        raise RuntimeError("testSecret: sf_consumer_key missing from pending secret")
-
+def jwt_login(consumer_key: str, private_key_pem: str) -> dict:
+    """JWT Bearer flow. Returns {'access_token','instance_url'}; raises on failure."""
+    now = int(datetime.datetime.now(datetime.timezone.utc).timestamp())
     assertion = jwt.encode(
         {
             "iss": consumer_key,
             "sub": SF_USERNAME,
             "aud": SF_LOGIN_URL,
-            "exp": int(time.time()) + 300,
+            "exp": now + 300,
         },
-        pending["sf_jwt_private_key"],
+        private_key_pem,
         algorithm="RS256",
     )
     resp = requests.post(
@@ -178,39 +104,174 @@ def _test_secret(sm, arn: str, token: str) -> None:
         timeout=30,
     )
     if resp.status_code != 200:
-        raise RuntimeError(
-            f"testSecret: JWT auth with pending key not yet accepted "
-            f"({resp.status_code}: {resp.text[:200]}). Expected until the new "
-            f"certificate is uploaded to Salesforce - rotation will retry."
-        )
-    logger.info("testSecret: pending key authenticated successfully")
+        raise RuntimeError(f"JWT auth failed ({resp.status_code}): {resp.text[:300]}")
+    return resp.json()
 
 
-def _finish_secret(sm, arn: str, token: str) -> None:
-    metadata = sm.describe_secret(SecretId=arn)
-    current_version = next(
-        (
-            v
-            for v, stages in metadata["VersionIdsToStages"].items()
-            if "AWSCURRENT" in stages
-        ),
-        None,
+def generate_keypair_and_cert() -> tuple[str, str]:
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    private_pem = key.private_bytes(
+        serialization.Encoding.PEM,
+        serialization.PrivateFormat.PKCS8,
+        serialization.NoEncryption(),
+    ).decode()
+    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, SF_ECA_FULLNAME)])
+    now = datetime.datetime.now(datetime.timezone.utc)
+    cert = (
+        x509.CertificateBuilder()
+        .subject_name(name)
+        .issuer_name(name)
+        .public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now - datetime.timedelta(minutes=5))
+        .not_valid_after(now + datetime.timedelta(days=CERT_VALIDITY_DAYS))
+        .sign(key, hashes.SHA256())
     )
-    if current_version == token:
-        logger.info("finishSecret: version already current")
+    return private_pem, cert.public_bytes(serialization.Encoding.PEM).decode()
+
+
+def get_secret_dict(arn: str, stage: str, token: str | None = None) -> dict:
+    kwargs = (
+        {"SecretId": arn, "VersionId": token}
+        if token
+        else {"SecretId": arn, "VersionStage": stage}
+    )
+    return json.loads(
+        _client("secretsmanager").get_secret_value(**kwargs)["SecretString"]
+    )
+
+
+# --------------------------------------------------------------------------
+# Rotation steps
+# --------------------------------------------------------------------------
+def create_secret(arn: str, token: str) -> None:
+    try:
+        get_secret_dict(arn, "AWSPENDING", token)
+        logger.info("createSecret: AWSPENDING already exists - idempotent skip")
         return
-    sm.update_secret_version_stage(
+    except _client("secretsmanager").exceptions.ResourceNotFoundException:
+        pass
+
+    current = get_secret_dict(arn, "AWSCURRENT")
+    if F_CONSUMER_KEY not in current:
+        raise RuntimeError(
+            f"AWSCURRENT is missing '{F_CONSUMER_KEY}'. The secret must be seeded "
+            f"with {F_CONSUMER_KEY} and {F_PRIVATE_KEY} before rotation can run."
+        )
+
+    private_pem, cert_pem = generate_keypair_and_cert()
+    pending = dict(current)  # carry through consumer key, pardot_* fields, etc.
+    pending[F_PRIVATE_KEY] = private_pem
+    pending[F_PENDING_CERT] = cert_pem
+    _client("secretsmanager").put_secret_value(
+        SecretId=arn,
+        ClientRequestToken=token,
+        SecretString=json.dumps(pending),
+        VersionStages=["AWSPENDING"],
+    )
+    logger.info("createSecret: new keypair staged as AWSPENDING")
+
+
+def set_secret(arn: str, token: str) -> None:
+    """Hand the new PUBLIC certificate to the admin. Salesforce is untouched."""
+    pending = get_secret_dict(arn, "AWSPENDING", token)
+    cert_pem = pending[F_PENDING_CERT]
+
+    notify(
+        f"ACTION REQUIRED: upload new certificate for {SF_ECA_FULLNAME}",
+        f"""A new JWT keypair has been generated for the Salesforce backup.
+
+The OLD key still works - backups are unaffected until you complete step 1.
+
+STEP 1 - Upload the certificate (Salesforce Setup)
+  External Client App Manager -> {SF_ECA_FULLNAME} -> OAuth Settings
+  -> Use digital signatures -> upload the certificate below.
+
+STEP 2 - Complete the rotation (AWS CLI)
+  aws secretsmanager rotate-secret --secret-id {arn}
+
+  This re-runs the rotation, which will now verify the new key and promote
+  it to AWSCURRENT. Until you do this, the backup keeps using the old key,
+  which stops working the moment step 1 replaces the certificate - so run
+  step 2 immediately after step 1.
+
+Certificate to upload (public - safe to email):
+
+{cert_pem}
+""",
+    )
+    logger.info("setSecret: certificate published for manual upload")
+
+
+def test_secret(arn: str, token: str) -> None:
+    """Verify the pending key. Expected to fail until the admin uploads the cert."""
+    pending = get_secret_dict(arn, "AWSPENDING", token)
+    try:
+        session = jwt_login(pending[F_CONSUMER_KEY], pending[F_PRIVATE_KEY])
+    except RuntimeError as auth_error:
+        # The designed hand-off point: no certificate uploaded yet.
+        raise RuntimeError(
+            f"testSecret: the pending key cannot authenticate yet. This is "
+            f"expected until the new certificate is uploaded to "
+            f"{SF_ECA_FULLNAME} in Salesforce Setup. After uploading, re-run: "
+            f"aws secretsmanager rotate-secret --secret-id {arn}. "
+            f"Underlying error: {auth_error}"
+        ) from auth_error
+
+    # Beyond token issuance, prove the session works for real API calls.
+    resp = requests.get(
+        f"{session['instance_url']}/services/data/",
+        headers={"Authorization": f"Bearer {session['access_token']}"},
+        timeout=30,
+    )
+    if resp.status_code != 200:
+        raise RuntimeError(f"testSecret: API smoke call failed ({resp.status_code})")
+    logger.info("testSecret: pending key authenticates and is usable")
+
+
+def finish_secret(arn: str, token: str) -> None:
+    meta = _client("secretsmanager").describe_secret(SecretId=arn)
+    current_version = None
+    for version_id, stages in meta.get("VersionIdsToStages", {}).items():
+        if "AWSCURRENT" in stages:
+            if version_id == token:
+                logger.info("finishSecret: already AWSCURRENT - idempotent skip")
+                return
+            current_version = version_id
+            break
+
+    _client("secretsmanager").update_secret_version_stage(
         SecretId=arn,
         VersionStage="AWSCURRENT",
         MoveToVersionId=token,
         RemoveFromVersionId=current_version,
     )
-    boto3.client("sns").publish(
-        TopicArn=SNS_TOPIC_ARN,
-        Subject="Salesforce backup JWT key rotation COMPLETED",
-        Message=(
-            "The rotated JWT key is now AWSCURRENT. After the next successful "
-            "backup run, remove the OLD certificate from the External Client App."
-        ),
+    notify(
+        f"Rotation completed for {SF_ECA_FULLNAME}",
+        f"The new JWT private key is now AWSCURRENT for {arn}.\n\n"
+        f"The previous key is retained as AWSPREVIOUS but no longer works: the "
+        f"certificate it matched has been replaced in Salesforce.",
     )
-    logger.info("finishSecret: rotation finalized")
+    logger.info("finishSecret: new key promoted to AWSCURRENT")
+
+
+def lambda_handler(event, context):
+    step, arn, token = event["Step"], event["SecretId"], event["ClientRequestToken"]
+    logger.info("Rotation step=%s secret=%s", step, arn)
+
+    meta = _client("secretsmanager").describe_secret(SecretId=arn)
+    if not meta.get("RotationEnabled", False):
+        raise ValueError(f"Rotation not enabled for {arn}")
+    stages = meta["VersionIdsToStages"].get(token, [])
+    if "AWSCURRENT" in stages:
+        logger.info("Version already AWSCURRENT - nothing to do")
+        return
+    if "AWSPENDING" not in stages:
+        raise ValueError(f"Version {token} not staged AWSPENDING for {arn}")
+
+    {
+        "createSecret": create_secret,
+        "setSecret": set_secret,
+        "testSecret": test_secret,
+        "finishSecret": finish_secret,
+    }[step](arn, token)

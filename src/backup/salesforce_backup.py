@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 [LAB VERSION] Salesforce (Sales Cloud) -> Amazon S3 daily backup.
 
@@ -20,19 +19,19 @@ from __future__ import annotations
 
 import csv
 import gzip
-import re
-from concurrent.futures import ThreadPoolExecutor, as_completed
 import json
 import logging
 import os
+import re
 import shutil
 import sys
 import tempfile
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
-from typing import Any, Optional
+from typing import Any
 
 import boto3
 import jwt
@@ -96,7 +95,7 @@ class Config:
     # Behaviour
     full_export_weekday: int  # 0 = Monday ... 6 = Sunday (Python convention)
     bulk_job_timeout_sec: int
-    sns_topic_arn: Optional[str]
+    sns_topic_arn: str | None
     volume_alert_threshold_pct: float
     bulk_api_quota_alert_pct: float
 
@@ -108,7 +107,7 @@ class Config:
     LAB_EMAIL = "nhikhanh28@gmail.com"
 
     @staticmethod
-    def from_env() -> "Config":
+    def from_env() -> Config:
         emails = [Config.LAB_EMAIL]
         return Config(
             # Consumer key is a fallback only - production stores it in Secrets Manager
@@ -166,7 +165,7 @@ class SecretsStore:
     def __init__(self, secret_id: str, region: str):
         self._client = boto3.client("secretsmanager", region_name=region)
         self._secret_id = secret_id
-        self._cache: Optional[dict[str, str]] = None
+        self._cache: dict[str, str] | None = None
 
     def get(self) -> dict[str, str]:
         if self._cache is None:
@@ -184,11 +183,11 @@ def retry_with_backoff(
     fn, *, attempts: int = 4, base_delay: float = 2.0, retriable=(Exception,)
 ):
     """Run fn() with exponential backoff. Re-raises the last exception on failure."""
-    last_exc: Optional[Exception] = None
+    last_exc: Exception | None = None
     for attempt in range(1, attempts + 1):
         try:
             return fn()
-        except retriable as exc:  # noqa: PERF203 - clarity over micro-perf here
+        except retriable as exc:
             last_exc = exc
             if attempt == attempts:
                 break
@@ -271,7 +270,7 @@ CUSTOMER_STANDARD_OBJECTS: tuple[str, ...] = (
 )
 
 
-def _build_full_field_soql(sf: Salesforce, object_name: str) -> Optional[str]:
+def _build_full_field_soql(sf: Salesforce, object_name: str) -> str | None:
     """Describes one object and returns a SELECT of all exportable fields,
     or None if the object has no exportable fields."""
     field_desc = getattr(sf, object_name).describe()["fields"]
@@ -325,10 +324,12 @@ def discover_export_objects(
         skipped = 0
         for object_name in candidates:
             try:
-                if skip_empty:
-                    if sf.query(f"SELECT COUNT() FROM {object_name}")["totalSize"] == 0:
-                        skipped += 1
-                        continue
+                if (
+                    skip_empty
+                    and sf.query(f"SELECT COUNT() FROM {object_name}")["totalSize"] == 0
+                ):
+                    skipped += 1
+                    continue
                 soql = _build_full_field_soql(sf, object_name)
                 if soql:
                     export_map[object_name] = soql
@@ -646,8 +647,8 @@ def export_pardot_object(
 
     def _fetch_all(fields_to_use: str) -> list[dict[str, Any]]:
         records: list[dict[str, Any]] = []
-        url: Optional[str] = f"{PARDOT_API_BASE}/{endpoint}"
-        params: Optional[dict[str, Any]] = {"fields": fields_to_use, "limit": 1000}
+        url: str | None = f"{PARDOT_API_BASE}/{endpoint}"
+        params: dict[str, Any] | None = {"fields": fields_to_use, "limit": 1000}
         while url:
 
             def _fetch_page(url=url, params=params):
@@ -695,7 +696,7 @@ def export_pardot_object(
     filepath = os.path.join(output_dir, f"{label}.csv")
     with open(filepath, "w", newline="", encoding="utf-8") as f:
         if records:
-            fieldnames = sorted({k for row in records for k in row.keys()})
+            fieldnames = sorted({k for row in records for k in row})
             writer = csv.DictWriter(f, fieldnames=fieldnames)
             writer.writeheader()
             for row in records:
@@ -774,9 +775,9 @@ class ObjectResult:
     object_name: str
     status: str  # "success" | "failed"
     row_count: int = 0
-    s3_key: Optional[str] = None
+    s3_key: str | None = None
     file_size_bytes: int = 0
-    error: Optional[str] = None
+    error: str | None = None
 
 
 @dataclass
@@ -785,11 +786,11 @@ class RunReport:
     started_at: str
     mode: str  # "full" | "incremental"
     results: list[ObjectResult] = field(default_factory=list)
-    finished_at: Optional[str] = None
-    duration_sec: Optional[float] = None
+    finished_at: str | None = None
+    duration_sec: float | None = None
     bulk_api_jobs_consumed: int = 0
     warnings: list = field(default_factory=list)  # anomaly / quota warnings
-    bulk_quota: Optional[dict] = None  # {"used": n, "max": n, "pct": f}
+    bulk_quota: dict | None = None  # {"used": n, "max": n, "pct": f}
 
     @property
     def total_rows(self) -> int:
@@ -828,9 +829,7 @@ def write_log_to_s3(
     logger.info("Execution log written to s3://%s/%s", bucket, log_key)
 
 
-def send_alert(
-    sns_client, topic_arn: Optional[str], subject: str, message: str
-) -> None:
+def send_alert(sns_client, topic_arn: str | None, subject: str, message: str) -> None:
     """Mid-run per-object failure alert via SNS (plain text, fast)."""
     logger.warning("ALERT: %s - %s", subject, message)
     if not topic_arn or sns_client is None:
@@ -977,7 +976,7 @@ def build_email_html(report: RunReport, s3_bucket: str) -> tuple[str, str]:
     return subject, html
 
 
-def send_email_report(ses_client, cfg: "Config", report: RunReport) -> None:
+def send_email_report(ses_client, cfg: Config, report: RunReport) -> None:
     """Sends the full HTML backup summary via Amazon SES."""
     if not cfg.notification_emails:
         logger.info("NOTIFICATION_EMAILS not set - skipping SES email report")
@@ -1023,7 +1022,7 @@ def send_email_report(ses_client, cfg: "Config", report: RunReport) -> None:
 CLOUDWATCH_NAMESPACE = "SalesforceBackup"
 
 
-def publish_volume_metric(cw_client, report: "RunReport") -> None:
+def publish_volume_metric(cw_client, report: RunReport) -> None:
     """Publishes this run's total row count as a CloudWatch custom metric.
     CloudWatch is the SoD-compliant history store: the encrypt-only backup
     role cannot read objects back from S3, and the metric carries only a
@@ -1045,8 +1044,8 @@ def publish_volume_metric(cw_client, report: "RunReport") -> None:
 
 
 def check_volume_anomaly(
-    cw_client, report: "RunReport", threshold_pct: float
-) -> Optional[str]:
+    cw_client, report: RunReport, threshold_pct: float
+) -> str | None:
     """Compares this run's total exported rows to the average of same-mode runs
     over the previous 7 days, read from CloudWatch custom metrics (the
     encrypt-only role cannot read execution logs back from S3 - see
@@ -1105,8 +1104,8 @@ def check_volume_anomaly(
 
 
 def check_bulk_api_quota(
-    sf: "Salesforce", report: "RunReport", threshold_pct: float
-) -> Optional[str]:
+    sf: Salesforce, report: RunReport, threshold_pct: float
+) -> str | None:
     """Reads org-wide Bulk API v2 query-job usage from the REST /limits endpoint
     and warns when consumption crosses threshold_pct of the daily quota.
 
@@ -1161,7 +1160,7 @@ def check_bulk_api_quota(
 
 
 def run_backup(
-    cfg: Optional[Config] = None, mode_override: Optional[str] = None
+    cfg: Config | None = None, mode_override: str | None = None
 ) -> dict[str, Any]:
     """mode_override: "full" or "incremental" forces the mode regardless of
     weekday - e.g. invoke Lambda with payload {"mode": "full"} for an on-demand
@@ -1201,7 +1200,7 @@ def run_backup(
             sf = get_salesforce_session(
                 cfg, secrets["sf_jwt_private_key"], consumer_key
             )
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             logger.exception("Salesforce authentication failed")
             send_alert(
                 sns_client,
@@ -1222,10 +1221,10 @@ def run_backup(
                 os.environ.get("SKIP_EMPTY_OBJECTS", "true").strip().lower() != "false"
             )
             try:
-                export_map, discovered, skipped = discover_export_objects(
+                export_map, _discovered, _skipped = discover_export_objects(
                     sf, export_scope, skip_empty
                 )
-            except Exception:  # noqa: BLE001 - discovery failure falls back to static list
+            except Exception:
                 logger.exception(
                     "Object discovery failed - falling back to static list"
                 )
@@ -1254,7 +1253,7 @@ def run_backup(
                         filepath, row_count = export_object_bulk(
                             sf, object_name, soql, tmp_dir
                         )
-                    except Exception as bulk_exc:  # noqa: BLE001
+                    except Exception as bulk_exc:
                         # Permanent Bulk 2.0 rejections (unsupported entity, no
                         # queryMore support, ...) fall back to the REST API.
                         markers = (
@@ -1302,7 +1301,7 @@ def run_backup(
                     )
                     result._used_bulk = used_bulk  # type: ignore[attr-defined]
                     return result
-                except Exception as exc:  # noqa: BLE001 - one object must never kill the whole run
+                except Exception as exc:
                     logger.exception("Export failed for object %s", object_name)
                     send_alert(
                         sns_client,
@@ -1449,7 +1448,7 @@ def run_backup(
                             cfg.s3_bucket,
                             s3_key,
                         )
-                    except Exception as exc:  # noqa: BLE001 - one Pardot object must not kill the rest
+                    except Exception as exc:
                         logger.exception("Pardot export failed for %s", label)
                         report.results.append(
                             ObjectResult(
@@ -1462,7 +1461,7 @@ def run_backup(
                             f"SF Backup: {label} export FAILED",
                             str(exc),
                         )
-            except Exception as exc:  # noqa: BLE001 - auth / validation failure for Pardot as a whole
+            except Exception as exc:
                 logger.exception("Pardot export failed")
                 report.results.append(
                     ObjectResult(
@@ -1538,7 +1537,7 @@ def run_backup(
 # --------------------------------------------------------------------------- #
 
 
-def lambda_handler(event, context):  # noqa: ANN001, ARG001 - AWS Lambda signature
+def lambda_handler(event, context):
     mode_override = (event or {}).get("mode") if isinstance(event, dict) else None
     result = run_backup(mode_override=mode_override)
     status_code = 200 if result["overall_status"] == "success" else 500
@@ -1580,7 +1579,7 @@ def _sfn_discover(event: dict) -> dict:
     sf = _sfn_auth(cfg)
     scope = os.environ.get("EXPORT_SCOPE", "customer").strip().lower()
     skip_empty = os.environ.get("SKIP_EMPTY_OBJECTS", "true").strip().lower() != "false"
-    export_map, discovered, skipped = discover_export_objects(sf, scope, skip_empty)
+    export_map, _discovered, _skipped = discover_export_objects(sf, scope, skip_empty)
 
     weekly_only = get_weekly_only_objects()
     objects = [n for n in export_map if not (incremental and n in weekly_only)]
@@ -1651,7 +1650,7 @@ def _sfn_export_object(event: dict) -> dict:
         with tempfile.TemporaryDirectory(prefix="sfn_") as tmp_dir:
             try:
                 filepath, row_count = export_object_bulk(sf, object_name, soql, tmp_dir)
-            except Exception as bulk_exc:  # noqa: BLE001
+            except Exception as bulk_exc:
                 markers = (
                     "INVALIDENTITY",
                     "is not supported",
@@ -1686,7 +1685,7 @@ def _sfn_export_object(event: dict) -> dict:
             "error": None,
             "used_bulk": used_bulk,
         }
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         logger.exception("SFN export failed for %s", object_name)
         return {
             "object_name": object_name,
@@ -1723,7 +1722,7 @@ def _sfn_export_pardot(event: dict) -> list:
                 f"Pardot enabled but secret missing real values for: {', '.join(missing)}"
             )
         token = get_pardot_token(cfg, secrets)
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         logger.exception("SFN pardot auth failed")
         return [
             {
@@ -1762,7 +1761,7 @@ def _sfn_export_pardot(event: dict) -> list:
                     "error": None,
                 }
             )
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             logger.exception("SFN pardot export failed for %s", label)
             results.append(
                 {
@@ -1863,7 +1862,7 @@ def _sfn_aggregate(event: dict) -> dict:
     return report.to_json()
 
 
-def step_handler(event, context):  # noqa: ANN001, ARG001 - AWS Lambda signature
+def step_handler(event, context):
     """Step Functions dispatcher: event["action"] selects the phase."""
     action = (event or {}).get("action")
     if action == "discover":
@@ -1898,7 +1897,7 @@ def main() -> int:
 
     try:
         result = run_backup(mode_override=mode)
-    except Exception:  # noqa: BLE001 - top-level safety net for cron/ECS
+    except Exception:
         logger.exception("Backup run aborted due to an unhandled error")
         return 1
     return 0 if result["overall_status"] == "success" else 1

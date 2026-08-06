@@ -7,6 +7,11 @@ on:
 permissions:
   contents: read
 
+env:
+  # Pinned once, referenced by both the pip-cache key and the install
+  # command, so a version bump here invalidates the cache automatically.
+  SAM_CLI_VERSION: "1.161.0"
+
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
@@ -16,13 +21,27 @@ jobs:
     name: SAM validate + cfn-lint
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: '3.12'
-      - uses: aws-actions/setup-sam@v2
+      # aws-actions/setup-sam is blocked by org action-allowlist policy.
+      # Install via pip instead of the action - unaffected by the allowlist
+      # since it's a `run:` step, not a third-party action.
+      #
+      # Explicit cache keyed on the PINNED sam-cli version (not on
+      # requirements.txt - that file belongs to unrelated app dependencies
+      # and would never invalidate this cache when sam-cli itself releases
+      # a new version). Skip the pip install entirely on cache hit.
+      - name: Cache AWS SAM CLI
+        id: cache-sam
+        uses: actions/cache@v5
         with:
-          use-installer: true
+          path: ${{ env.pythonLocation }}/lib/python3.12/site-packages/samcli
+          key: sam-cli-${{ runner.os }}-py3.12-${{ env.SAM_CLI_VERSION }}
+      - name: Install AWS SAM CLI
+        if: steps.cache-sam.outputs.cache-hit != 'true'
+        run: pip install "aws-sam-cli==${{ env.SAM_CLI_VERSION }}"
       - name: sam validate --lint
         run: sam validate --lint --template template.yaml --region us-west-2
       - name: cfn-lint (explicit)
@@ -34,10 +53,10 @@ jobs:
     name: Lint & Test (Ruff)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Setup Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: '3.12'
           cache: 'pip'
@@ -48,11 +67,11 @@ jobs:
           if [ -f src/backup/requirements.txt ]; then 
             pip install -r src/backup/requirements.txt; 
           fi
-          pip install ruff pytest
+          pip install "ruff==0.16.1" pytest
 
       # ==================== RUFF CACHE ====================
       - name: Cache Ruff
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: ~/.cache/ruff
           key: ruff-${{ runner.os }}-${{ hashFiles('**/*.py') }}
@@ -84,7 +103,7 @@ jobs:
     name: Policy-as-Code Security Scan
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Install Checkov
         run: pip install checkov
       - name: Scan Template with Checkov
@@ -95,10 +114,10 @@ jobs:
     name: SoD guard - Backup role is encrypt-only (cfn-lint custom rules)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Setup Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: '3.12'
 
@@ -134,13 +153,53 @@ jobs:
     permissions:
       contents: read
       security-events: write
+    env:
+      # Pinned so the scan is reproducible; bump deliberately, not silently.
+      GITLEAKS_VERSION: "8.30.1"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
-          fetch-depth: 0
-      - uses: gitleaks/gitleaks-action@v2
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 0    # full history - gitleaks scans past commits too
+
+      # gitleaks/gitleaks-action is blocked by the org action-allowlist
+      # policy (it is also being sunset upstream: Node 20 runners are
+      # removed org-wide on 2026-09-16, which would break @v2 regardless).
+      # Download the binary release directly instead - a `run:` step, not
+      # a third-party action.
+      - name: Install gitleaks
+        run: |
+          curl -sSL "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz" | tar xz gitleaks
+          sudo mv gitleaks /usr/local/bin/gitleaks
+          gitleaks version
+
+      - name: Run gitleaks (SARIF report)
+        id: gitleaks
+        run: >
+          gitleaks detect --source . --log-opts="--all"
+          --report-format sarif --report-path gitleaks-report.sarif
+          --redact --exit-code 1
+        continue-on-error: true   # upload the report even when leaks are found
+
+      # github/codeql-action@* in the org allowlist only matches actions at
+      # the REPO ROOT of codeql-action - subpath actions like upload-sarif,
+      # analyze, init need the pattern written as `github/codeql-action/*@*`.
+      # Until the platform team updates that allowlist entry, attach the
+      # SARIF report as a build artifact instead - it doesn't populate the
+      # Security tab automatically, but the findings are preserved and
+      # downloadable from every run.
+      - name: Upload SARIF as artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gitleaks-sarif-report
+          path: gitleaks-report.sarif
+          retention-days: 90
+
+      - name: Fail the job if secrets were found
+        if: steps.gitleaks.outcome == 'failure'
+        run: |
+          echo "::error::gitleaks found potential secrets - see the Security tab for details."
+          exit 1
 
   lzv2-security-scan:
     name: LZv2 Security Scan

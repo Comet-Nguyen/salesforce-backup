@@ -15,6 +15,7 @@ Usage: cfn-lint template.yaml --append-rules .github/cfn-lint-rules
 """
 
 from fnmatch import fnmatch
+from typing import ClassVar
 
 from cfnlint.rules import CloudFormationLintRule, RuleMatch
 
@@ -52,7 +53,7 @@ class SodBackupRoleEncryptOnly(CloudFormationLintRule):
         "silently prevents the rule from loading at all."
     )
     source_url = "https://internal-wiki/SoD-backup-role"
-    tags = ["iam", "security", "sod", "least-privilege"]
+    tags: ClassVar[list[str]] = ["iam", "security", "sod", "least-privilege"]
 
     def _statement_violations(self, statement, path):
         matches = []

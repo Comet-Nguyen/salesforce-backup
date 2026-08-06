@@ -37,6 +37,15 @@ Parameters:
   SalesforceUsername:
     Type: String
 
+  RotationIntervalDays:
+    Type: Number
+    Default: 90
+    MinValue: 1
+    MaxValue: 365
+    Description: >-
+      Days between automatic secret rotations. PRD must stay at 90 (CISO
+      requirement); the lab sets 1 to exercise the rotation path quickly.
+
   SalesforceEcaFullName:
     Type: String
     Default: SF_Backup_S3
@@ -103,33 +112,37 @@ Resources:
     Properties:
       SecretId: !Ref BackupSecret
       RotationRules:
-        AutomaticallyAfterDays: 90
+        AutomaticallyAfterDays: !Ref RotationIntervalDays
+      # Explicit: the AWS default is true, which fires a rotation the moment
+      # this resource is created or updated. Kept false so a deploy never
+      # rotates by surprise - rotation starts on schedule, or on demand via
+      # `aws secretsmanager rotate-secret`.
+      RotateImmediatelyOnUpdate: false
       RotationLambdaARN: !GetAtt RotationFunction.Arn
 
   RotationFunction:
     Type: AWS::Serverless::Function
     Properties:
       FunctionName: !Sub salesforce-backup-rotation-${EnvironmentName}
-      # Fully-automated JWT rotation via Salesforce Metadata API:
-      # createSecret generates RSA-2048 + self-signed cert (AWSPENDING);
-      # setSecret deploys the cert to ExtlClntAppGlobalOauthSettings.certificate
-      # (single slot: old key dies on deploy; rollback = redeploy old cert via
-      # the pre-swap session, which survives the change); testSecret verifies
-      # the new key end-to-end; finishSecret promotes AWSCURRENT + SNS notify.
-      # Org prerequisites: "Allow Access to OAuth Consumer Secrets via Metadata
-      # API" enabled + integration user has the consumer-secrets-in-metadata
-      # permission. Schedule rotation AWAY from the 01:00 UTC backup window.
-      Description: Fully-automated 90-day JWT cert rotation via Metadata API
+      # Semi-automated JWT rotation - the Salesforce team uploads the
+      # certificate by hand, so the function never touches Salesforce config.
+      # Phase 1 (scheduled): createSecret generates RSA-2048 + self-signed
+      # cert; setSecret publishes the PUBLIC cert over SNS; testSecret then
+      # FAILS by design - the old cert is still installed, so the old key
+      # still works and backups keep running.
+      # Phase 2 (after the manual upload): re-trigger with
+      # `aws secretsmanager rotate-secret` -> testSecret passes ->
+      # finishSecret promotes the new key to AWSCURRENT.
+      Description: Semi-automated JWT key rotation (certificate uploaded manually)
       Handler: rotation_function.lambda_handler
       CodeUri: src/rotation/
-      Timeout: 120        # Metadata read + deploy + verify + potential rollback
+      Timeout: 60         # keygen + one JWT auth attempt + SNS publish
       Environment:
         Variables:
           SNS_TOPIC_ARN: !Ref BackupAlertsTopic
           SF_LOGIN_URL: !Ref SalesforceLoginUrl
           SF_USERNAME: !Ref SalesforceUsername
           SF_ECA_FULLNAME: !Ref SalesforceEcaFullName
-          METADATA_API_VERSION: "62.0"
       Policies:
         - Statement:
             - Sid: RotateThisSecretOnly
