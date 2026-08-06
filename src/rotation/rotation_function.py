@@ -65,6 +65,7 @@ CERT_VALIDITY_DAYS = int(os.environ.get("CERT_VALIDITY_DAYS", "365"))
 # an SNS text notice with the cert pasted inline (degraded but not silent).
 SES_SENDER_EMAIL = os.environ.get("SES_SENDER_EMAIL", "")
 ALERT_EMAIL_ADDRESS = os.environ.get("ALERT_EMAIL_ADDRESS", "")
+POLL_RULE_NAME = os.environ.get("POLL_RULE_NAME", "")
 
 # Field names - single source of truth, must match salesforce_backup.py
 F_CONSUMER_KEY = "sf_consumer_key"
@@ -270,6 +271,51 @@ def create_secret(arn: str, token: str) -> None:
     logger.info("createSecret: new keypair staged as AWSPENDING")
 
 
+# --------------------------------------------------------------------------
+# Self-poll: while a rotation waits on the manual certificate upload, an
+# EventBridge schedule re-invokes rotate-secret every 30 minutes so the
+# rotation completes on its own shortly after the upload, instead of
+# depending on someone remembering to run `rotate-secret` by hand.
+# The rule starts DISABLED (see template.yaml) - set_secret enables it,
+# finish_secret disables it. Both toggles are best-effort: a failure here
+# must never break the rotation itself, only the auto-resume convenience.
+# --------------------------------------------------------------------------
+def _enable_poll_rule() -> None:
+    if not POLL_RULE_NAME:
+        return
+    try:
+        _client("events").enable_rule(Name=POLL_RULE_NAME)
+        logger.info("Poll rule enabled - rotate-secret will retry every 30 min")
+    except Exception:
+        logger.exception("Failed to enable poll rule (continuing)")
+
+
+def _disable_poll_rule() -> None:
+    if not POLL_RULE_NAME:
+        return
+    try:
+        _client("events").disable_rule(Name=POLL_RULE_NAME)
+        logger.info("Poll rule disabled - nothing pending")
+    except Exception:
+        logger.exception("Failed to disable poll rule (continuing)")
+
+
+def poll_rotation(secret_arn: str) -> None:
+    """EventBridge poll target. Safety guard is deliberate: calling
+    rotate-secret when NOTHING is pending would start a brand-new,
+    unwanted rotation cycle on a healthy secret. Only re-trigger when an
+    AWSPENDING version actually exists; otherwise self-disable and exit -
+    covers the case where finish_secret's disable call failed earlier."""
+    meta = _client("secretsmanager").describe_secret(SecretId=secret_arn)
+    stages = meta.get("VersionIdsToStages", {})
+    if not any("AWSPENDING" in s for s in stages.values()):
+        logger.info("pollRotation: nothing pending - disabling poll rule")
+        _disable_poll_rule()
+        return
+    _client("secretsmanager").rotate_secret(SecretId=secret_arn)
+    logger.info("pollRotation: rotate-secret re-triggered")
+
+
 def set_secret(arn: str, token: str) -> None:
     """Hand the new PUBLIC certificate to the admin. Salesforce is untouched.
 
@@ -278,6 +324,10 @@ def set_secret(arn: str, token: str) -> None:
     and each retry re-invokes setSecret. Skip re-sending if this token's
     certificate email already went out.
     """
+    # Still waiting on the manual step regardless of whether this call sends
+    # a fresh email - keep the poll rule on (idempotent if already enabled).
+    _enable_poll_rule()
+
     if _already_notified(arn, token):
         logger.info(
             "setSecret: certificate email already sent for this version - "
@@ -357,10 +407,17 @@ def finish_secret(arn: str, token: str) -> None:
         f"The previous key is retained as AWSPREVIOUS but no longer works: the "
         f"certificate it matched has been replaced in Salesforce.",
     )
+    _disable_poll_rule()
     logger.info("finishSecret: new key promoted to AWSCURRENT, AWSPENDING cleared")
 
 
 def lambda_handler(event, context):
+    # EventBridge poll target - distinct payload shape from Secrets
+    # Manager's own rotation-step invocations (which always carry "Step").
+    if event.get("Action") == "poll_rotation":
+        poll_rotation(event["SecretArn"])
+        return
+
     step, arn, token = event["Step"], event["SecretId"], event["ClientRequestToken"]
     logger.info("Rotation step=%s secret=%s", step, arn)
 
