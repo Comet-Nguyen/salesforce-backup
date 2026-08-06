@@ -46,6 +46,15 @@ Parameters:
       Days between automatic secret rotations. PRD must stay at 90 (CISO
       requirement); the lab sets 1 to exercise the rotation path quickly.
 
+  AlertEmailAddress:
+    Type: String
+    Default: ""
+    Description: >-
+      Email to subscribe to BackupAlertsTopic (rotation notices, export
+      failures, volume anomalies). Leave empty to skip - subscribe manually
+      with `aws sns subscribe` instead. Must be confirmed via the email AWS
+      sends before any alert is actually delivered.
+
   SalesforceEcaFullName:
     Type: String
     Default: SF_Backup_S3
@@ -73,6 +82,9 @@ Globals:
 # ============================================================================
 # RESOURCES
 # ============================================================================
+Conditions:
+  HasAlertEmail: !Not [!Equals [!Ref AlertEmailAddress, ""]]
+
 Resources:
 
   # --------------------------------------------------------------------------
@@ -82,6 +94,18 @@ Resources:
     Type: AWS::SNS::Topic
     Properties:
       TopicName: !Sub salesforce-backup-alerts-${EnvironmentName}
+
+  # Optional: wire an email subscription at deploy time so alerts (including
+  # rotation notifications) reach someone without a manual `aws sns subscribe`
+  # step. NOTE: email subscriptions start PendingConfirmation - the address
+  # must click the confirmation link AWS sends before any message arrives.
+  BackupAlertsEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: HasAlertEmail
+    Properties:
+      TopicArn: !Ref BackupAlertsTopic
+      Protocol: email
+      Endpoint: !Ref AlertEmailAddress
 
   # --------------------------------------------------------------------------
   # Secrets Manager - credentials with 90-day rotation
