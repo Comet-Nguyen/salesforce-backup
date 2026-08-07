@@ -33,9 +33,11 @@ Any other keys (pardot_*) are carried through untouched.
 """
 
 import datetime
+import io
 import json
 import logging
 import os
+import zipfile
 from email.mime.application import MIMEApplication
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
@@ -103,11 +105,17 @@ def notify(subject: str, message: str) -> None:
 
 
 def send_cert_email(cert_pem: str) -> None:
-    """Deliver the new certificate as a real .crt attachment via SES.
+    """Deliver the new certificate as a .crt file inside a .zip via SES.
 
-    SNS email is plain text only - it cannot carry attachments, which is
-    why the certificate was previously pasted inline as text. Falls back to
-    an SNS text notice (cert inline) if SES sender/recipient are not
+    SES's SendRawEmail rejects several uncommon-but-harmless extensions
+    with "Illegal filename" - confirmed empirically against this account
+    for .crt (and documented for others such as .pem, .key, .cer). .zip is
+    an accepted extension, and zipping means the admin gets the correctly
+    named SF_Backup_S3.crt file back out - no manual rename step.
+
+    SNS email is plain text only - it cannot carry attachments at all,
+    which is why the certificate was previously pasted inline as text.
+    Falls back to that SNS text notice if SES sender/recipient are not
     configured, so the admin still gets *something* rather than silence.
     """
     if not (SES_SENDER_EMAIL and ALERT_EMAIL_ADDRESS):
@@ -122,6 +130,14 @@ def send_cert_email(cert_pem: str) -> None:
         )
         return
 
+    cert_filename = f"{SF_ECA_FULLNAME}.crt"
+    zip_filename = f"{SF_ECA_FULLNAME}.zip"
+
+    zip_buffer = io.BytesIO()
+    with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr(cert_filename, cert_pem)
+    zip_bytes = zip_buffer.getvalue()
+
     msg = MIMEMultipart()
     msg["Subject"] = f"ACTION REQUIRED: upload new certificate for {SF_ECA_FULLNAME}"
     msg["From"] = SES_SENDER_EMAIL
@@ -132,9 +148,10 @@ def send_cert_email(cert_pem: str) -> None:
 
 The OLD key still works - backups are unaffected until you complete step 1.
 
-STEP 1 - Upload the attached certificate ({SF_ECA_FULLNAME}.crt) in Salesforce Setup:
-  External Client App Manager -> {SF_ECA_FULLNAME} -> OAuth Settings
-  -> Use digital signatures -> upload the attached certificate.
+STEP 1 - Upload the certificate in Salesforce Setup:
+  a) Unzip the attachment ({zip_filename}) to get {cert_filename}
+  b) External Client App Manager -> {SF_ECA_FULLNAME} -> OAuth Settings
+     -> Use digital signatures -> upload {cert_filename}
 
 STEP 2 - Complete the rotation (AWS CLI), immediately after step 1:
   aws secretsmanager rotate-secret --secret-id <this secret's ARN>
@@ -145,10 +162,8 @@ replaces the certificate.
 """
         )
     )
-    attachment = MIMEApplication(cert_pem.encode(), _subtype="x-x509-ca-cert")
-    attachment.add_header(
-        "Content-Disposition", "attachment", filename=f"{SF_ECA_FULLNAME}.crt"
-    )
+    attachment = MIMEApplication(zip_bytes, _subtype="zip")
+    attachment.add_header("Content-Disposition", "attachment", filename=zip_filename)
     msg.attach(attachment)
 
     try:
@@ -157,7 +172,9 @@ replaces the certificate.
             Destinations=[ALERT_EMAIL_ADDRESS],
             RawMessage={"Data": msg.as_string()},
         )
-        logger.info("send_cert_email: certificate delivered as .crt attachment via SES")
+        logger.info(
+            "send_cert_email: certificate delivered as .crt inside a .zip via SES"
+        )
     except Exception:
         logger.exception("SES send failed - falling back to SNS text notice")
         notify(
