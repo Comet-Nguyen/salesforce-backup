@@ -68,6 +68,21 @@ Parameters:
       Recipient for rotation's certificate-attachment email. SNS Topic
       subscriptions are managed manually, not via this template.
 
+  Owner:
+    Type: String
+    Default: "nhikhanh28@gmail.com"
+    Description: Tag value - required by the customer org's tagging policy.
+
+  BusinessUnit:
+    Type: String
+    Default: MVCorp
+    Description: Tag value - required by the customer org's tagging policy.
+
+  Application:
+    Type: String
+    Default: SalesforceBackup
+    Description: Tag value - required by the customer org's tagging policy.
+
   SalesforceEcaFullName:
     Type: String
     Default: SF_Backup_S3
@@ -91,6 +106,11 @@ Globals:
     Runtime: python3.12
     MemorySize: 512
     Architectures: [x86_64]
+    Tags:
+      Env: !Ref EnvironmentName
+      Owner: !Ref Owner
+      BusinessUnit: !Ref BusinessUnit
+      Application: !Ref Application
 
 # ============================================================================
 # RESOURCES
@@ -104,6 +124,15 @@ Resources:
     Type: AWS::SNS::Topic
     Properties:
       TopicName: !Sub salesforce-backup-alerts-${EnvironmentName}
+      Tags:
+        - Key: Env
+          Value: !Ref EnvironmentName
+        - Key: Owner
+          Value: !Ref Owner
+        - Key: BusinessUnit
+          Value: !Ref BusinessUnit
+        - Key: Application
+          Value: !Ref Application
 
 
   # --------------------------------------------------------------------------
@@ -114,6 +143,15 @@ Resources:
     Properties:
       Name: !Sub salesforce-backup-${EnvironmentName}/credentials
       Description: JWT private key, consumer key and Pardot credentials
+      Tags:
+        - Key: Env
+          Value: !Ref EnvironmentName
+        - Key: Owner
+          Value: !Ref Owner
+        - Key: BusinessUnit
+          Value: !Ref BusinessUnit
+        - Key: Application
+          Value: !Ref Application
       SecretString: |
         {
           "sf_jwt_private_key": "REPLACE_VIA_SECURE_CHANNEL",
@@ -311,6 +349,15 @@ Resources:
     Type: AWS::CloudWatch::Alarm
     Properties:
       AlarmName: !Sub salesforce-backup-duration-${EnvironmentName}
+      Tags:
+        - Key: Env
+          Value: !Ref EnvironmentName
+        - Key: Owner
+          Value: !Ref Owner
+        - Key: BusinessUnit
+          Value: !Ref BusinessUnit
+        - Key: Application
+          Value: !Ref Application
       AlarmDescription: >
         Backup duration exceeded 600s (2/3 of Lambda timeout) - per the
         architecture decision record, 3 consecutive breaches trigger the
@@ -338,6 +385,13 @@ Resources:
     Type: AWS::Serverless::StateMachine
     Properties:
       Name: !Sub salesforce-backup-${EnvironmentName}
+      # Globals.StateMachine does not support Tags (only PropagateTags) -
+      # unlike Globals.Function, so it must be set directly here.
+      Tags:
+        Env: !Ref EnvironmentName
+        Owner: !Ref Owner
+        BusinessUnit: !Ref BusinessUnit
+        Application: !Ref Application
       Type: STANDARD
       DefinitionSubstitutions:
         WorkerArn: !GetAtt BackupFunction.Arn
