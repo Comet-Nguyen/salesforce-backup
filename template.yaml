@@ -37,6 +37,49 @@ Parameters:
   SalesforceUsername:
     Type: String
 
+  RotationIntervalDays:
+    Type: Number
+    Default: 180
+    MinValue: 1
+    MaxValue: 365
+    Description: >-
+      Days between automatic secret rotations. PRD must stay at 180
+
+  SesSenderEmail:
+    Type: String
+    # Lab-only hardcode (matches Config.LAB_EMAIL in salesforce_backup_lab.py) -
+    # not a secret, so no GitHub variable needed. Must be an SES-verified
+    # identity in this account/region.
+    Default: "nhikhanh28@gmail.com"
+    Description: >-
+      SES-verified sender address for the rotation function's certificate
+      email (MIME attachment - requires ses:SendRawEmail).
+
+  AlertEmailAddress:
+    Type: String
+    # Recipient for the SES certificate-attachment email. NOT used to
+    # auto-create an SNS subscription (that is done manually via
+    # `aws sns subscribe` + confirming the email, by design - see README).
+    Default: "nhikhanh28@gmail.com"
+    Description: >-
+      Recipient for rotation's certificate-attachment email. SNS Topic
+      subscriptions are managed manually, not via this template.
+
+  Owner:
+    Type: String
+    Default: "nhikhanh28@gmail.com"
+    Description: Tag value - required by the customer org's tagging policy.
+
+  BusinessUnit:
+    Type: String
+    Default: MVCorp
+    Description: Tag value - required by the customer org's tagging policy.
+
+  Application:
+    Type: String
+    Default: SalesforceBackup
+    Description: Tag value - required by the customer org's tagging policy.
+
   SalesforceEcaFullName:
     Type: String
     Default: SF_Backup_S3
@@ -60,6 +103,11 @@ Globals:
     Runtime: python3.12
     MemorySize: 512
     Architectures: [x86_64]
+    Tags:
+      Env: !Ref EnvironmentName
+      Owner: !Ref Owner
+      BusinessUnit: !Ref BusinessUnit
+      Application: !Ref Application
 
 # ============================================================================
 # RESOURCES
@@ -73,15 +121,34 @@ Resources:
     Type: AWS::SNS::Topic
     Properties:
       TopicName: !Sub salesforce-backup-alerts-${EnvironmentName}
+      Tags:
+        - Key: Env
+          Value: !Ref EnvironmentName
+        - Key: Owner
+          Value: !Ref Owner
+        - Key: BusinessUnit
+          Value: !Ref BusinessUnit
+        - Key: Application
+          Value: !Ref Application
+
 
   # --------------------------------------------------------------------------
-  # Secrets Manager - credentials with 90-day rotation
+  # Secrets Manager - credentials with 180-day rotation
   # --------------------------------------------------------------------------
   BackupSecret:
     Type: AWS::SecretsManager::Secret
     Properties:
       Name: !Sub salesforce-backup-${EnvironmentName}/credentials
       Description: JWT private key, consumer key and Pardot credentials
+      Tags:
+        - Key: Env
+          Value: !Ref EnvironmentName
+        - Key: Owner
+          Value: !Ref Owner
+        - Key: BusinessUnit
+          Value: !Ref BusinessUnit
+        - Key: Application
+          Value: !Ref Application
       SecretString: |
         {
           "sf_jwt_private_key": "REPLACE_VIA_SECURE_CHANNEL",
@@ -103,33 +170,44 @@ Resources:
     Properties:
       SecretId: !Ref BackupSecret
       RotationRules:
-        AutomaticallyAfterDays: 90
+        AutomaticallyAfterDays: !Ref RotationIntervalDays
+      # Explicit: the AWS default is true, which fires a rotation the moment
+      # this resource is created or updated. Kept false so a deploy never
+      # rotates by surprise - rotation starts on schedule, or on demand via
+      # `aws secretsmanager rotate-secret`.
+      RotateImmediatelyOnUpdate: false
       RotationLambdaARN: !GetAtt RotationFunction.Arn
 
   RotationFunction:
     Type: AWS::Serverless::Function
     Properties:
       FunctionName: !Sub salesforce-backup-rotation-${EnvironmentName}
-      # Fully-automated JWT rotation via Salesforce Metadata API:
-      # createSecret generates RSA-2048 + self-signed cert (AWSPENDING);
-      # setSecret deploys the cert to ExtlClntAppGlobalOauthSettings.certificate
-      # (single slot: old key dies on deploy; rollback = redeploy old cert via
-      # the pre-swap session, which survives the change); testSecret verifies
-      # the new key end-to-end; finishSecret promotes AWSCURRENT + SNS notify.
-      # Org prerequisites: "Allow Access to OAuth Consumer Secrets via Metadata
-      # API" enabled + integration user has the consumer-secrets-in-metadata
-      # permission. Schedule rotation AWAY from the 01:00 UTC backup window.
-      Description: Fully-automated 90-day JWT cert rotation via Metadata API
+      # Semi-automated JWT rotation - the Salesforce team uploads the
+      # certificate by hand, so the function never touches Salesforce config.
+      # Phase 1 (scheduled): createSecret generates RSA-2048 + self-signed
+      # cert; setSecret publishes the PUBLIC cert over SNS; testSecret then
+      # FAILS by design - the old cert is still installed, so the old key
+      # still works and backups keep running.
+      # Phase 2 (after the manual upload): re-trigger with
+      # `aws secretsmanager rotate-secret` -> testSecret passes ->
+      # finishSecret promotes the new key to AWSCURRENT.
+      Description: Semi-automated JWT key rotation (certificate uploaded manually)
       Handler: rotation_function.lambda_handler
       CodeUri: src/rotation/
-      Timeout: 120        # Metadata read + deploy + verify + potential rollback
+      Timeout: 60         # keygen + one JWT auth attempt + SNS publish
       Environment:
         Variables:
           SNS_TOPIC_ARN: !Ref BackupAlertsTopic
           SF_LOGIN_URL: !Ref SalesforceLoginUrl
           SF_USERNAME: !Ref SalesforceUsername
           SF_ECA_FULLNAME: !Ref SalesforceEcaFullName
-          METADATA_API_VERSION: "62.0"
+          SES_SENDER_EMAIL: !Ref SesSenderEmail
+          ALERT_EMAIL_ADDRESS: !Ref AlertEmailAddress
+          # Built via Sub, NOT via Ref/GetAtt to the Events.PollRotation
+          # source below - referencing that resource's logical ID here
+          # would create a circular dependency (function -> rule -> function).
+          # Must stay in sync with the Schedule event's Name: property.
+          POLL_RULE_NAME: !Sub salesforce-backup-rotation-poll-${EnvironmentName}
       Policies:
         - Statement:
             - Sid: RotateThisSecretOnly
@@ -139,11 +217,50 @@ Resources:
                 - secretsmanager:PutSecretValue
                 - secretsmanager:DescribeSecret
                 - secretsmanager:UpdateSecretVersionStage
+                # TagResource: idempotency marker (CertNotifiedForVersion) so
+                # a retried, still-incomplete rotation does not resend the
+                # certificate email on every retry.
+                - secretsmanager:TagResource
               Resource: !Ref BackupSecret
             - Sid: NotifyAdmin
               Effect: Allow
               Action: sns:Publish
               Resource: !Ref BackupAlertsTopic
+            - Sid: SendCertEmail
+              Effect: Allow
+              # SendRawEmail (not SendEmail) is required for MIME attachments -
+              # this is how the certificate is delivered as a real .crt file.
+              Action: ses:SendRawEmail
+              Resource: !Sub arn:aws:ses:${AWS::Region}:${AWS::AccountId}:identity/*
+            - Sid: SelfTriggerRotation
+              Effect: Allow
+              # Lets the poll target re-invoke rotate-secret while a
+              # rotation is waiting on the manual certificate upload.
+              Action: secretsmanager:RotateSecret
+              Resource: !Ref BackupSecret
+            - Sid: TogglePollRule
+              Effect: Allow
+              Action:
+                - events:EnableRule
+                - events:DisableRule
+              Resource: !Sub arn:aws:events:${AWS::Region}:${AWS::AccountId}:rule/salesforce-backup-rotation-poll-${EnvironmentName}
+      Events:
+        # Self-triggered re-attempt while a rotation is waiting on the
+        # manual certificate upload. Starts DISABLED - setSecret enables it
+        # the moment a rotation begins waiting; finishSecret disables it
+        # again once the rotation completes. Safe at any cadence since every
+        # step in the 4-step flow is idempotent; 30 minutes balances
+        # responsiveness against needless API calls over a 180-day cycle.
+        PollRotation:
+          Type: Schedule
+          Properties:
+            Name: !Sub salesforce-backup-rotation-poll-${EnvironmentName}
+            Description: >-
+              Re-attempts rotate-secret while waiting on a manual certificate
+              upload. Enabled/disabled by the rotation function itself.
+            Schedule: rate(30 minutes)
+            Enabled: false
+            Input: !Sub '{"Action": "poll_rotation", "SecretArn": "${BackupSecret}"}'
 
   RotationInvokePermission:
     Type: AWS::Lambda::Permission
@@ -192,12 +309,13 @@ Resources:
             # ---- SoD core: WRITE-ONLY data path ----
             - Sid: S3PutOnly
               Effect: Allow
-              Action: s3:PutObject          # deliberately NO GetObject/ListBucket
+              Action: s3:PutObject
               Resource: !Sub ${S3BucketArn}/*
             - Sid: KMSEncryptOnly
               Effect: Allow
               Action:                        # GenerateDataKey ONLY - decrypt is excluded by design
                 - kms:GenerateDataKey
+                - kms:DescribeKey
               Resource: !Ref KMSKeyArn
             # ---- Operational permissions (no backup-data access) ----
             - Sid: SecretsReadSpecificArn
@@ -229,6 +347,15 @@ Resources:
     Type: AWS::CloudWatch::Alarm
     Properties:
       AlarmName: !Sub salesforce-backup-duration-${EnvironmentName}
+      Tags:
+        - Key: Env
+          Value: !Ref EnvironmentName
+        - Key: Owner
+          Value: !Ref Owner
+        - Key: BusinessUnit
+          Value: !Ref BusinessUnit
+        - Key: Application
+          Value: !Ref Application
       AlarmDescription: >
         Backup duration exceeded 600s (2/3 of Lambda timeout) - per the
         architecture decision record, 3 consecutive breaches trigger the
@@ -256,6 +383,13 @@ Resources:
     Type: AWS::Serverless::StateMachine
     Properties:
       Name: !Sub salesforce-backup-${EnvironmentName}
+      # Globals.StateMachine does not support Tags (only PropagateTags) -
+      # unlike Globals.Function, so it must be set directly here.
+      Tags:
+        Env: !Ref EnvironmentName
+        Owner: !Ref Owner
+        BusinessUnit: !Ref BusinessUnit
+        Application: !Ref Application
       Type: STANDARD
       DefinitionSubstitutions:
         WorkerArn: !GetAtt BackupFunction.Arn
