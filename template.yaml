@@ -136,7 +136,7 @@ Resources:
 
 
   # --------------------------------------------------------------------------
-  # Secrets Manager - credentials with 90-day rotation
+  # Secrets Manager - credentials with 180-day rotation
   # --------------------------------------------------------------------------
   BackupSecret:
     Type: AWS::SecretsManager::Secret
@@ -312,12 +312,13 @@ Resources:
             # ---- SoD core: WRITE-ONLY data path ----
             - Sid: S3PutOnly
               Effect: Allow
-              Action: s3:PutObject          # deliberately NO GetObject/ListBucket
+              Action: s3:PutObject
               Resource: !Sub ${S3BucketArn}/*
             - Sid: KMSEncryptOnly
               Effect: Allow
               Action:                        # GenerateDataKey ONLY - decrypt is excluded by design
                 - kms:GenerateDataKey
+                - kms:DescribeKey
               Resource: !Ref KMSKeyArn
             # ---- Operational permissions (no backup-data access) ----
             - Sid: SecretsReadSpecificArn

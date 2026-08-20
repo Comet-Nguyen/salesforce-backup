@@ -52,7 +52,6 @@ jobs:
         S3BucketArn=${{ vars.S3_BUCKET_ARN_UAT }}
         SalesforceUsername=${{ vars.SF_USERNAME_UAT }}
         SalesforceLoginUrl=${{ vars.SF_LOGIN_URL_UAT }}
-        RotationIntervalDays=1
 
   deploy-prd:
     name: Deploy PRD
