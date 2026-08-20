@@ -43,10 +43,7 @@ Parameters:
     MinValue: 1
     MaxValue: 365
     Description: >-
-      Days between automatic secret rotations. PRD must stay at 180 (CISO
-      confirmed - supersedes the 90-day figure in the original
-      SecurityRequirements doc); the lab sets 1 to exercise the rotation
-      path quickly.
+      Days between automatic secret rotations. PRD must stay at 180
 
   SesSenderEmail:
     Type: String
