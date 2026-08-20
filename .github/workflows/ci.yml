@@ -211,7 +211,3 @@ jobs:
     secrets: inherit
     with:
       python_lock_file: src/backup/requirements.txt
-      # No docker inputs: the Dockerfile left the repo with the Step Functions
-      # decision (kept locally as the Fargate exit plan). The local
-      # security-scan.yml copy skips its docker jobs when dockerfile_path is
-      # empty - propose the same conditional to the LZv2 team upstream.
