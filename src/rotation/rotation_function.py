@@ -146,19 +146,17 @@ def send_cert_email(cert_pem: str) -> None:
         MIMEText(
             f"""A new JWT keypair has been generated for the Salesforce backup.
 
-The OLD key still works - backups are unaffected until you complete step 1.
+The OLD key still works - backups are unaffected until you complete the
+step below.
 
-STEP 1 - Upload the certificate in Salesforce Setup:
+Upload the certificate in Salesforce Setup:
   a) Unzip the attachment ({zip_filename}) to get {cert_filename}
   b) External Client App Manager -> {SF_ECA_FULLNAME} -> OAuth Settings
      -> Use digital signatures -> upload {cert_filename}
 
-STEP 2 - Complete the rotation (AWS CLI), immediately after step 1:
-  aws secretsmanager rotate-secret --secret-id <this secret's ARN>
-
-This re-verifies the new key and promotes it. Until step 2 runs, the
-backup keeps using the old key, which stops working the moment step 1
-replaces the certificate.
+That is the only step needed. The backup system checks automatically
+every 30 minutes and switches over to the new key on its own as soon as
+the upload is detected - no further action, no AWS CLI command to run.
 """
         )
     )
@@ -366,13 +364,15 @@ def test_secret(arn: str, token: str) -> None:
     try:
         session = jwt_login(pending[F_CONSUMER_KEY], pending[F_PRIVATE_KEY])
     except RuntimeError as auth_error:
-        # The designed hand-off point: no certificate uploaded yet.
+        # The designed hand-off point: no certificate uploaded yet. The
+        # EventBridge poll (enabled by setSecret) will retry this
+        # automatically every 30 minutes - no manual re-run needed once
+        # the certificate is uploaded.
         raise RuntimeError(
             f"testSecret: the pending key cannot authenticate yet. This is "
             f"expected until the new certificate is uploaded to "
-            f"{SF_ECA_FULLNAME} in Salesforce Setup. After uploading, re-run: "
-            f"aws secretsmanager rotate-secret --secret-id {arn}. "
-            f"Underlying error: {auth_error}"
+            f"{SF_ECA_FULLNAME} in Salesforce Setup. The poll will retry "
+            f"automatically once that happens. Underlying error: {auth_error}"
         ) from auth_error
 
     # Beyond token issuance, prove the session works for real API calls.
